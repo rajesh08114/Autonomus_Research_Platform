@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "ai-quantum-research-platform"
+version = "2.0.0"
+description = "Autonomous LLM-orchestrated quantum and AI research backend"
+authors = ["Research Platform"]
+readme = "README.md"
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.116.1"
+uvicorn = "^0.35.0"
+pydantic = "^2.11.7"
+pydantic-settings = "^2.11.0"
+httpx = "^0.28.1"
+requests = "^2.32.3"
+structlog = "^25.4.0"
+langgraph = "^0.6.7"
+sqlalchemy = "^2.0.43"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.2"
+pytest-asyncio = "^1.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
