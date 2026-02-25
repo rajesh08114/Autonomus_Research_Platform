@@ -8,12 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from src.agents.clarifier_agent import (
-    QUESTION_BANK,
-    build_clarification_question,
-    clarifier_agent_node,
-    next_clarification_question_id,
-)
+from src.agents.clarifier_agent import clarifier_agent_node, coerce_answer_value, regenerate_pending_question_state
 from src.agents.code_gen_agent import code_gen_agent_node
 from src.agents.dataset_agent import dataset_agent_node
 from src.agents.doc_generator_agent import doc_generator_agent_node
@@ -24,6 +19,8 @@ from src.agents.job_scheduler_agent import job_scheduler_agent_node
 from src.agents.planner_agent import planner_agent_node
 from src.agents.quantum_gate import quantum_gate_node
 from src.config.settings import settings
+from src.core.execution_mode import normalize_execution_mode
+from src.core.history_scope import build_collection_key, normalize_user_id
 from src.core.logger import get_logger
 from src.core.phase_validator import validate_phase_output
 from src.core.rl_feedback import (
@@ -62,15 +59,27 @@ def _is_terminal(state: ResearchState) -> bool:
     return value in {ExperimentStatus.SUCCESS.value, ExperimentStatus.ABORTED.value, ExperimentStatus.FAILED.value}
 
 
-def _apply_answers(state: ResearchState, answers: dict[str, Any]) -> None:
-    mapped: dict[str, Any] = {}
-    for qid, value in answers.items():
-        item = QUESTION_BANK.get(qid)
-        if item:
-            mapped[item["topic"]] = value
-        else:
-            mapped[qid] = value
-    state["clarifications"].update(mapped)
+def _question_plan(pending: dict[str, Any]) -> list[dict[str, Any]]:
+    plan = pending.get("question_plan")
+    if isinstance(plan, list):
+        output = [item for item in plan if isinstance(item, dict)]
+        if output:
+            return output
+    current = _active_question(pending)
+    return [current] if isinstance(current, dict) else []
+
+
+def _question_topic(question: dict[str, Any]) -> str:
+    topic = str(question.get("topic", "")).strip().lower()
+    if topic:
+        return topic
+    return str(question.get("id", "unknown")).strip() or "unknown"
+
+
+def _apply_answers(state: ResearchState, answers: dict[str, Any], current_question: dict[str, Any]) -> None:
+    topic = _question_topic(current_question)
+    _, value = next(iter(answers.items()))
+    state["clarifications"][topic] = coerce_answer_value(current_question, value)
 
 
 def _active_question(pending: dict[str, Any]) -> dict[str, Any] | None:
@@ -90,6 +99,21 @@ def _should_fail_injection(point: str) -> bool:
     if configured and point.lower() not in configured:
         return False
     return random.random() < float(max(0.0, min(1.0, settings.FAILURE_INJECTION_RATE)))
+
+
+def _bool_from_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value in {0, 1}:
+            return bool(value)
+        return None
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled", "enable"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled", "disable"}:
+        return False
+    return None
 
 
 def _running_task(experiment_id: str) -> asyncio.Task | None:
@@ -119,16 +143,42 @@ async def _run_background(experiment_id: str) -> None:
             await ExperimentRepository.mark_failed(experiment_id, str(exc))
 
 
-async def start_experiment(prompt: str, config_overrides: dict[str, Any]) -> str:
+async def start_experiment(
+    prompt: str,
+    config_overrides: dict[str, Any],
+    research_type: str = "ai",
+    user_id: str | None = None,
+    test_mode: bool = False,
+) -> str:
     experiment_id = _new_experiment_id()
     project_path = str((settings.project_root_path / experiment_id).resolve())
     Path(project_path).mkdir(parents=True, exist_ok=True)
 
-    state = new_research_state(experiment_id, project_path, prompt, config_overrides)
-    provider = settings.MASTER_LLM_PROVIDER.strip().lower()
-    state["llm_provider"] = provider
-    state["llm_model"] = settings.huggingface_model_id if provider in {"huggingface", "hf", "hugging_face"} else settings.MASTER_LLM_MODEL
+    overrides = dict(config_overrides or {})
+    normalized_user = normalize_user_id(user_id)
+    collection_key = build_collection_key(normalized_user, test_mode)
+    overrides["user_id"] = normalized_user
+    overrides["test_mode"] = bool(test_mode)
+    overrides["collection_key"] = collection_key
+    normalized_research_type = str(research_type or overrides.get("research_type", "ai")).strip().lower()
+    if normalized_research_type not in {"ai", "quantum"}:
+        normalized_research_type = "ai"
+    overrides["research_type"] = normalized_research_type
+
+    state = new_research_state(experiment_id, project_path, prompt, overrides)
+    state["research_type"] = normalized_research_type
+    if normalized_research_type == "quantum":
+        state["llm_provider"] = "quantum_llm"
+        if settings.codehub_enabled:
+            state["llm_model"] = settings.codehub_generate_url
+        else:
+            state["llm_model"] = settings.QUANTUM_LLM_ENDPOINT or "quantum_local_template"
+    else:
+        provider = settings.effective_master_llm_provider
+        state["llm_provider"] = provider
+        state["llm_model"] = settings.huggingface_model_id if provider == "huggingface" else "rule_based_fallback"
     state["execution_target"] = "local_machine"
+    state["execution_mode"] = normalize_execution_mode(overrides.get("execution_mode", settings.EXECUTION_MODE))
     logger.info("experiment.start", experiment_id=experiment_id, project_path=project_path)
     state = await clarifier_agent_node(state)
     validation = validate_phase_output("clarifier", state)
@@ -169,7 +219,20 @@ async def start_experiment(prompt: str, config_overrides: dict[str, Any]) -> str
         "system",
         "info",
         "Experiment configured for local execution",
-        {"execution_target": state["execution_target"], "llm_provider": state["llm_provider"], "llm_model": state["llm_model"]},
+        {
+            "execution_target": state["execution_target"],
+            "execution_mode": state["execution_mode"],
+            "llm_provider": state["llm_provider"],
+            "llm_model": state["llm_model"],
+            "research_type": state.get("research_type", "ai"),
+        },
+    )
+    await ExperimentRepository.add_to_collection(
+        experiment_id=experiment_id,
+        collection_key=collection_key,
+        user_id=normalized_user,
+        test_mode=test_mode,
+        metadata={"prompt": prompt[:200], "research_type": state.get("research_type", "ai")},
     )
     return experiment_id
 
@@ -225,13 +288,16 @@ async def run_until_blocked(state: ResearchState) -> ResearchState:
                 state["phase"] = "dataset_manager"
         elif phase == "dataset_manager":
             state = await dataset_agent_node(state)
-            state["phase"] = "code_generator"
+            if not _is_waiting(state):
+                state["phase"] = "code_generator"
         elif phase == "code_generator":
             state = await code_gen_agent_node(state)
-            state["phase"] = "quantum_gate" if state["requires_quantum"] else "job_scheduler"
+            if not _is_waiting(state):
+                state["phase"] = "quantum_gate" if state["requires_quantum"] else "job_scheduler"
         elif phase == "quantum_gate":
             state = await quantum_gate_node(state)
-            state["phase"] = "job_scheduler"
+            if not _is_waiting(state):
+                state["phase"] = "job_scheduler"
         elif phase == "job_scheduler":
             state = await job_scheduler_agent_node(state)
             state["phase"] = "subprocess_runner"
@@ -254,8 +320,10 @@ async def run_until_blocked(state: ResearchState) -> ResearchState:
             primary_name = str(state.get("target_metric", "accuracy"))
             evaluation = (state.get("metrics") or {}).get("evaluation", {})
             primary_metric = float((evaluation or {}).get(primary_name, 0.0))
+            retry_pref = _bool_from_value((state.get("clarifications") or {}).get("auto_retry_preference"))
+            auto_retry_enabled = retry_pref if retry_pref is not None else bool(settings.AUTO_RETRY_ON_LOW_METRIC)
             if (
-                settings.AUTO_RETRY_ON_LOW_METRIC
+                auto_retry_enabled
                 and primary_metric < float(settings.MIN_PRIMARY_METRIC_FOR_SUCCESS)
                 and int(state.get("retry_count", 0)) < int(settings.MAX_RETRY_COUNT)
             ):
@@ -272,6 +340,7 @@ async def run_until_blocked(state: ResearchState) -> ResearchState:
                         "primary_metric": primary_metric,
                         "threshold": float(settings.MIN_PRIMARY_METRIC_FOR_SUCCESS),
                         "retry_count": state["retry_count"],
+                        "auto_retry_enabled": auto_retry_enabled,
                         "next_phase": "subprocess_runner",
                     },
                 )
@@ -284,6 +353,7 @@ async def run_until_blocked(state: ResearchState) -> ResearchState:
                         "target_metric": primary_name,
                         "primary_metric": primary_metric,
                         "threshold": float(settings.MIN_PRIMARY_METRIC_FOR_SUCCESS),
+                        "auto_retry_enabled": auto_retry_enabled,
                     },
                 )
             else:
@@ -432,37 +502,24 @@ async def submit_answers(experiment_id: str, answers: dict[str, Any]) -> Researc
     if qid != expected_qid:
         raise RuntimeError(f"Expected answer for question {expected_qid}, got {qid}")
 
-    _apply_answers(state, {qid: value})
+    _apply_answers(state, {qid: value}, current)
+    normalized_value = (state.get("clarifications") or {}).get(_question_topic(current))
     logger.info("experiment.answer_received", experiment_id=experiment_id, question_id=qid)
 
     answered = list(pending.get("answered") or [])
-    answered.append({"id": qid, "value": value, "timestamp": time.time()})
+    answered.append({"id": qid, "topic": _question_topic(current), "value": normalized_value, "timestamp": time.time()})
     asked_question_ids = [str(x) for x in list(pending.get("asked_question_ids") or []) if x]
     if qid not in asked_question_ids:
         asked_question_ids.append(qid)
 
-    next_qid = next_clarification_question_id(state, asked_question_ids=asked_question_ids)
-    max_questions = int(pending.get("max_questions") or 12)
-    if len(asked_question_ids) >= max_questions:
-        next_qid = None
+    pending_for_replan = dict(pending)
+    pending_for_replan["asked_question_ids"] = asked_question_ids
+    pending_for_replan["answered"] = answered
+    next_pending = await regenerate_pending_question_state(state, pending_for_replan)
+    state["llm_calls_count"] = int(state.get("llm_calls_count", 0)) + 1
 
-    if next_qid:
-        next_question = build_clarification_question(
-            next_qid,
-            state,
-            prompt_flags=pending.get("prompt_flags") if isinstance(pending.get("prompt_flags"), dict) else None,
-        )
-        state["pending_user_question"] = {
-            "mode": str(pending.get("mode") or "sequential_dynamic"),
-            "current_question": next_question,
-            "questions": [next_question],
-            "asked_question_ids": asked_question_ids,
-            "answered": answered,
-            "answered_count": len(answered),
-            "total_questions_planned": len(answered) + 1,
-            "max_questions": max_questions,
-            "prompt_flags": pending.get("prompt_flags", {}),
-        }
+    if next_pending:
+        state["pending_user_question"] = next_pending
         state["status"] = ExperimentStatus.WAITING.value
         state["phase"] = "clarifier"
         await ExperimentRepository.update(experiment_id, state)
@@ -472,9 +529,9 @@ async def submit_answers(experiment_id: str, answers: dict[str, Any]) -> Researc
             "info",
             "Clarification answer received; next question queued",
             {
-                "answer": {"id": qid, "value": value},
-                "next_question": next_question,
-                "asked_question_ids": asked_question_ids,
+                "answer": {"id": qid, "value": normalized_value},
+                "next_question": next_pending.get("current_question"),
+                "asked_question_ids": next_pending.get("asked_question_ids", []),
             },
         )
         return state
@@ -488,7 +545,7 @@ async def submit_answers(experiment_id: str, answers: dict[str, Any]) -> Researc
         "clarifier",
         "info",
         "Clarification completed",
-        {"answers": answered},
+        {"answers": answered, "last_answer": {"id": qid, "value": normalized_value}},
     )
     if settings.WORKFLOW_BACKGROUND_ENABLED:
         _schedule_background_run(experiment_id)
@@ -502,32 +559,47 @@ async def submit_confirmation(
     decision: str,
     reason: str = "",
     alternative_preference: str = "",
+    execution_result: dict[str, Any] | None = None,
 ) -> ResearchState:
     state = await ExperimentRepository.get(experiment_id)
     if not state:
         raise ValueError("Experiment not found")
     if not state.get("pending_user_confirm"):
         raise RuntimeError("No pending confirmation")
+    pending = state.get("pending_user_confirm") or {}
+    pending_phase = str(pending.get("phase", state.get("phase", "env_manager")))
 
-    state = await apply_user_confirmation(state, action_id, decision, reason, alternative_preference)
+    state = await apply_user_confirmation(
+        state,
+        action_id,
+        decision,
+        reason,
+        alternative_preference,
+        execution_result=execution_result,
+    )
     logger.info("experiment.confirmation", experiment_id=experiment_id, action_id=action_id, decision=decision)
     await record_phase_feedback(
         experiment_id=experiment_id,
-        phase="env_manager",
+        phase=pending_phase,
         reward=reward_from_user_decision(decision),
         signal="user_confirmation",
-        details={"decision": decision, "action_id": action_id},
+        details={"decision": decision, "action_id": action_id, "action": pending.get("action")},
     )
     await ExperimentRepository.update(experiment_id, state)
     await ExperimentRepository.add_log(
         experiment_id,
-        "env_manager",
+        pending_phase,
         "info",
         f"Confirmation processed: {decision}",
-        {"action_id": action_id, "decision": decision, "reason": reason, "alternative_preference": alternative_preference},
+        {
+            "action_id": action_id,
+            "decision": decision,
+            "reason": reason,
+            "alternative_preference": alternative_preference,
+            "action": pending.get("action"),
+        },
     )
     if not _is_waiting(state):
-        state["phase"] = "env_manager"
         await ExperimentRepository.update(experiment_id, state)
         if settings.WORKFLOW_BACKGROUND_ENABLED:
             _schedule_background_run(experiment_id)
@@ -621,11 +693,22 @@ def summarize_for_list(state_row: dict[str, Any]) -> dict[str, Any]:
     duration = None
     if state_row.get("completed_at"):
         duration = 0
+    research_type = "quantum" if bool(state_row.get("requires_quantum")) else "ai"
+    raw_state = state_row.get("state_json")
+    if isinstance(raw_state, str) and raw_state.strip():
+        try:
+            parsed = json.loads(raw_state)
+            value = str(parsed.get("research_type", research_type)).strip().lower()
+            if value in {"ai", "quantum"}:
+                research_type = value
+        except Exception:
+            pass
     return {
         "experiment_id": state_row["id"],
         "status": state_row["status"],
         "phase": state_row["phase"],
         "prompt_preview": (state_row["prompt"] or "")[:80],
+        "research_type": research_type,
         "requires_quantum": bool(state_row["requires_quantum"]),
         "framework": state_row.get("framework"),
         "primary_metric": {"name": state_row.get("target_metric"), "value": None},

@@ -1,6 +1,8 @@
 .env
 .env.*
 !.env.example
+.envrc
+.python-version
 .pytest_cache/
 __pycache__/
 *.pyc
@@ -8,3 +10,5 @@ htmlcov/
 .mypy_cache/
 workspace/
 venv/
+.venv/
+*.log

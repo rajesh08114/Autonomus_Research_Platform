@@ -26,6 +26,7 @@ def _state() -> ResearchState:
         required_packages=[],
         installed_packages=[],
         venv_path="",
+        venv_ready=False,
         output_format=".py",
         dataset_source="synthetic",
         dataset_path="",

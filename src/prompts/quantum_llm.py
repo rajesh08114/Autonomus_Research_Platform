@@ -7,7 +7,7 @@ OBJECTIVE:
 SAFETY RULES:
 - Return Python code only (no markdown/prose).
 - Do not access paths or external services.
-- Keep output deterministic and import-safe.
+- Keep output import-safe and aligned with provided qubit count/backend/algorithm.
 
 ACCURACY RULES:
 - Must include class QuantumLayer with forward().

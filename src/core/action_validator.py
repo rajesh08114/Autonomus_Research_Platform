@@ -27,6 +27,7 @@ REQUIRED_FIELDS = {
     "write_code": ["file_path", "content"],
     "modify_file": ["file_path", "find", "replace"],
     "install_package": ["package", "version"],
+    "ask_user": ["questions"],
 }
 
 PATH_RESTRICTED_ACTIONS = {"write_code", "modify_file", "run_python", "create_file"}
@@ -124,5 +125,16 @@ def validate_action(action: dict[str, Any], state: ResearchState, phase: str | N
             return False, f"Unsafe package name: {package}"
         if package != "__complete__" and (not version or not PINNED_PACKAGE_RE.match(version)):
             return False, f"Unsafe package version: {version}"
+
+    if action_name == "ask_user":
+        questions = params.get("questions")
+        if not isinstance(questions, list):
+            return False, "ask_user.questions must be an array"
+        for idx, item in enumerate(questions):
+            if not isinstance(item, dict):
+                return False, f"ask_user.questions[{idx}] must be an object"
+            for field in ("id", "text", "type"):
+                if field not in item:
+                    return False, f"ask_user.questions[{idx}] missing {field}"
 
     return True, "ok"

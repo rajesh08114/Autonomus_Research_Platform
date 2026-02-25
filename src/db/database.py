@@ -109,6 +109,27 @@ async def init_db() -> None:
                 timestamp           DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS research_collections (
+                id                  TEXT PRIMARY KEY,
+                experiment_id       TEXT NOT NULL,
+                collection_key      TEXT NOT NULL,
+                user_id             TEXT,
+                test_mode           BOOLEAN DEFAULT FALSE,
+                metadata_json       TEXT,
+                created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id                  TEXT PRIMARY KEY,
+                collection_key      TEXT NOT NULL,
+                user_id             TEXT,
+                test_mode           BOOLEAN DEFAULT FALSE,
+                role                TEXT NOT NULL,
+                message             TEXT NOT NULL,
+                metadata_json       TEXT,
+                created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
             CREATE INDEX IF NOT EXISTS idx_experiments_phase ON experiments(phase);
             CREATE INDEX IF NOT EXISTS idx_logs_experiment ON experiment_logs(experiment_id);
@@ -118,6 +139,12 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_rl_experiment ON rl_feedback(experiment_id);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_experiment ON llm_usage(experiment_id);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_provider ON llm_usage(provider);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_research_collections_unique
+            ON research_collections(experiment_id, collection_key);
+            CREATE INDEX IF NOT EXISTS idx_research_collections_key ON research_collections(collection_key);
+            CREATE INDEX IF NOT EXISTS idx_research_collections_user ON research_collections(user_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_history_collection ON chat_history(collection_key);
+            CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id);
             """
         )
         conn.commit()

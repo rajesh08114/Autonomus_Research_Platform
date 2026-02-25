@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
 from src.api.dependencies import get_request_id
+from src.config.settings import settings
 from src.core.logger import get_logger
 from src.db.repository import ExperimentRepository
 from src.graph.runner import (
@@ -28,16 +29,43 @@ logger = get_logger(__name__)
 
 @router.post("/research/start", status_code=201)
 async def post_start(request: StartResearchRequest, request_id: str = Depends(get_request_id)):
-    logger.info("api.research.start", request_id=request_id, prompt_len=len(request.prompt))
-    experiment_id = await start_experiment(request.prompt, request.config_overrides)
+    logger.info("api.research.start", request_id=request_id, prompt_len=len(request.prompt), research_type=request.research_type)
+    normalized_research_type = str(request.research_type or "ai").strip().lower()
+    if (
+        normalized_research_type != "quantum"
+        and settings.effective_master_llm_provider == "huggingface"
+        and not settings.huggingface_api_key
+        and not settings.ALLOW_RULE_BASED_FALLBACK
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=error_payload(
+                "LLM_CONFIGURATION_ERROR",
+                "HF_API_KEY (or MASTER_LLM_API_KEY) is required when ALLOW_RULE_BASED_FALLBACK=false.",
+            ),
+        )
+    experiment_id = await start_experiment(
+        request.prompt,
+        request.config_overrides,
+        research_type=request.research_type,
+        user_id=request.user_id,
+        test_mode=request.test_mode,
+    )
     state = await get_experiment_or_404(experiment_id)
     data = {
         "experiment_id": experiment_id,
         "status": state["status"],
         "phase": state["phase"],
+        "research_type": state.get("research_type", request.research_type),
         "created_at": state["timestamp_start"],
         "execution_target": state.get("execution_target", "local_machine"),
+        "execution_mode": state.get("execution_mode", "vscode_extension"),
         "llm": {"provider": state.get("llm_provider"), "model": state.get("llm_model")},
+        "research_scope": {
+            "user_id": state.get("research_user_id", "anonymous"),
+            "test_mode": bool(state.get("test_mode", False)),
+            "collection_key": state.get("collection_key"),
+        },
         "estimated_duration_minutes": 15,
         "pending_questions": state.get("pending_user_question"),
         "links": {
@@ -62,6 +90,7 @@ async def post_answer(experiment_id: str, request: AnswerRequest, request_id: st
 
     data = {
         "experiment_id": experiment_id,
+        "research_type": state.get("research_type", "ai"),
         "answers_received": len(request.answers),
         "answered_question_ids": list(request.answers.keys()),
         "status": state["status"],
@@ -88,6 +117,7 @@ async def post_confirm(experiment_id: str, request: ConfirmRequest, request_id: 
             decision=request.decision,
             reason=request.reason,
             alternative_preference=request.alternative_preference,
+            execution_result=request.execution_result,
         )
     except ValueError:
         raise HTTPException(status_code=404, detail=error_payload("EXPERIMENT_NOT_FOUND", f"Experiment {experiment_id} does not exist"))
@@ -96,6 +126,7 @@ async def post_confirm(experiment_id: str, request: ConfirmRequest, request_id: 
 
     data = {
         "experiment_id": experiment_id,
+        "research_type": state.get("research_type", "ai"),
         "action_id": request.action_id,
         "decision": request.decision,
         "status": state["status"],
@@ -121,12 +152,15 @@ async def get_research(experiment_id: str, request_id: str = Depends(get_request
         "created_at": state["timestamp_start"],
         "updated_at": state["timestamp_end"] or state["timestamp_start"],
         "prompt": state["user_prompt"],
+        "research_type": state.get("research_type", "ai"),
         "requires_quantum": state["requires_quantum"],
         "quantum_framework": state["quantum_framework"],
         "framework": state["framework"],
         "dataset_source": state["dataset_source"],
         "hardware_target": state["hardware_target"],
         "retry_count": state["retry_count"],
+        "llm_calls_count": state.get("llm_calls_count", 0),
+        "total_tokens_used": state.get("total_tokens_used", 0),
         "confirmations_requested": state.get("confirmations_requested", 0),
         "confirmations_processed": state.get("confirmations_processed", 0),
         "phase_timings": state["phase_timings"],
@@ -137,7 +171,13 @@ async def get_research(experiment_id: str, request_id: str = Depends(get_request
         "metrics": state["metrics"],
         "llm_total_cost_usd": state.get("llm_total_cost_usd", 0.0),
         "execution_target": state.get("execution_target", "local_machine"),
+        "execution_mode": state.get("execution_mode", "vscode_extension"),
         "llm": {"provider": state.get("llm_provider"), "model": state.get("llm_model")},
+        "research_scope": {
+            "user_id": state.get("research_user_id", "anonymous"),
+            "test_mode": bool(state.get("test_mode", False)),
+            "collection_key": state.get("collection_key"),
+        },
         "links": {
             "logs": f"/api/v1/research/{experiment_id}/logs",
             "files": f"/api/v1/research/{experiment_id}/files",
@@ -166,7 +206,9 @@ async def get_status(
         "experiment_id": experiment_id,
         "status": state["status"],
         "phase": state["phase"],
+        "research_type": state.get("research_type", "ai"),
         "retry_count": state["retry_count"],
+        "llm_calls_count": state.get("llm_calls_count", 0),
         "confirmations_requested": state.get("confirmations_requested", 0),
         "confirmations_processed": state.get("confirmations_processed", 0),
         "current_script": state["current_script"],
@@ -174,6 +216,7 @@ async def get_status(
         "waiting_for_user": state["status"] == "waiting_user",
         "pending_action": state.get("pending_user_confirm"),
         "execution_target": state.get("execution_target", "local_machine"),
+        "execution_mode": state.get("execution_mode", "vscode_extension"),
         "llm_provider": state.get("llm_provider"),
         "llm_model": state.get("llm_model"),
         "last_updated": state.get("timestamp_end") or state["timestamp_start"],

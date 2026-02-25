@@ -21,10 +21,10 @@ def _estimate_tokens(text: str) -> int:
     return max(1, int(len(value) / 4))
 
 
-def _rule_based_fallback() -> str:
+def _local_structured_fallback() -> str:
     payload: dict[str, Any] = {
         "action": "ask_user",
-        "reasoning": "Rule-based mode fallback. Generating safe clarification step.",
+        "reasoning": "Local structured fallback used while remote provider is unavailable.",
         "parameters": {"questions": []},
         "next_step": "planner",
         "confidence": 0.6,
@@ -88,10 +88,6 @@ async def _invoke_huggingface_chat(
         completion_tokens = _estimate_tokens(content)
     if total_tokens == 0:
         total_tokens = prompt_tokens + completion_tokens
-    estimated_cost = (
-        (prompt_tokens / 1000.0) * float(settings.LLM_COST_PER_1K_INPUT_TOKENS)
-        + (completion_tokens / 1000.0) * float(settings.LLM_COST_PER_1K_OUTPUT_TOKENS)
-    )
     logger.info(
         "llm.huggingface.response",
         model=model,
@@ -110,7 +106,7 @@ async def _invoke_huggingface_chat(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
-        estimated_cost_usd=estimated_cost,
+        estimated_cost_usd=0.0,
         success=True,
     )
     return content
@@ -124,29 +120,27 @@ async def invoke_master_llm(
 ) -> str:
     """Master LLM adapter.
 
-    This project ships with a deterministic fallback for local development.
+    Uses configured provider or auto-selects best available provider.
     """
-    provider = settings.MASTER_LLM_PROVIDER.strip().lower()
+    provider = settings.effective_master_llm_provider
     logger.info("llm.invoke.start", provider=provider)
     if provider == "rule_based":
-        content = _rule_based_fallback()
+        if not settings.ALLOW_RULE_BASED_FALLBACK:
+            raise RuntimeError("Rule-based fallback is disabled. Configure HF_API_KEY for autonomous LLM execution.")
+        content = _local_structured_fallback()
         prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
         completion_tokens = _estimate_tokens(content)
         total_tokens = prompt_tokens + completion_tokens
-        estimated_cost = (
-            (prompt_tokens / 1000.0) * float(settings.LLM_COST_PER_1K_INPUT_TOKENS)
-            + (completion_tokens / 1000.0) * float(settings.LLM_COST_PER_1K_OUTPUT_TOKENS)
-        )
         await ExperimentRepository.add_llm_usage(
             experiment_id=experiment_id,
             phase=phase,
             provider="rule_based",
-            model=settings.MASTER_LLM_MODEL,
+            model="local_structured_fallback",
             latency_ms=0.1,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            estimated_cost_usd=estimated_cost,
+            estimated_cost_usd=0.0,
             success=True,
         )
         return content
@@ -170,8 +164,9 @@ async def invoke_master_llm(
                 success=False,
                 error_message=str(exc),
             )
-            # Safe fallback keeps orchestration alive in non-production setups.
-            return _rule_based_fallback()
+            if settings.ALLOW_RULE_BASED_FALLBACK:
+                return _local_structured_fallback()
+            raise RuntimeError(f"Hugging Face invocation failed: {exc}") from exc
 
     # Placeholder for provider-specific integration in production.
-    raise RuntimeError("Configured master LLM provider is not implemented in this local build.")
+    raise RuntimeError(f"Configured master LLM provider '{provider}' is not implemented.")

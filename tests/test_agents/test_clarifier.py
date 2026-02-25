@@ -13,3 +13,4 @@ async def test_clarifier_generates_questions(tmp_path):
     assert state["pending_user_question"] is not None
     assert len(state["pending_user_question"]["questions"]) == 1
     assert state["pending_user_question"]["current_question"]["id"] == state["pending_user_question"]["questions"][0]["id"]
+    assert state["pending_user_question"]["current_question"]["topic"]

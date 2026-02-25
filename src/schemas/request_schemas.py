@@ -7,9 +7,12 @@ from pydantic import BaseModel, Field, HttpUrl
 
 class StartResearchRequest(BaseModel):
     prompt: str = Field(min_length=10, max_length=2000)
+    research_type: Literal["ai", "quantum"] = "ai"
     priority: Literal["low", "normal", "high"] = "normal"
     tags: list[str] = Field(default_factory=list, max_length=10)
     webhook_url: HttpUrl | None = None
+    user_id: str | None = Field(default=None, max_length=64)
+    test_mode: bool = False
     config_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -22,6 +25,7 @@ class ConfirmRequest(BaseModel):
     decision: Literal["confirm", "deny"]
     reason: str = Field(default="", max_length=500)
     alternative_preference: str = ""
+    execution_result: dict[str, Any] | None = None
 
 
 class AbortRequest(BaseModel):
@@ -33,3 +37,15 @@ class RetryRequest(BaseModel):
     from_phase: str | None = None
     reset_retries: bool = True
     override_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatResearchRequest(BaseModel):
+    message: str = Field(min_length=3, max_length=4000)
+    user_id: str | None = Field(default=None, max_length=64)
+    test_mode: bool = False
+    context_limit: int = Field(default=5, ge=1, le=20)
+
+
+class ChatHistoryRequest(BaseModel):
+    user_id: str | None = Field(default=None, max_length=64)
+    test_mode: bool = False

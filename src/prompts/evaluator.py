@@ -12,7 +12,7 @@ SAFETY RULES:
 ACCURACY RULES:
 - Prefer metrics file when present; fallback to logs only when required.
 - Always emit primary metric and full metric map.
-- Keep plot references deterministic and reproducible.
+- Keep plot references reproducible and mapped to user-selected target metric.
 
 RL POLICY:
 {rl_policy}

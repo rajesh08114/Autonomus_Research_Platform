@@ -7,10 +7,14 @@ from pathlib import Path
 from typing import Callable
 
 from src.config.settings import settings
+from src.core.execution_mode import BACKEND_MODE, VSCODE_EXTENSION_MODE, is_vscode_execution_mode
 from src.core.security import ensure_project_path
 from src.state.research_state import ResearchState
 
 PACKAGE_SPEC_RE = re.compile(r"^[A-Za-z0-9_.\-]+==[A-Za-z0-9_.\-]+$")
+ALLOWED_QUESTION_TYPES = {"choice", "text", "boolean", "number"}
+ALLOWED_PROBLEM_TYPES = {"classification", "regression", "clustering", "reinforcement", "forecasting", "generation"}
+ALLOWED_CODE_LEVELS = {"low", "intermediate", "advanced"}
 
 
 @dataclass(slots=True)
@@ -36,6 +40,15 @@ def _ensure_all_paths_within_project(paths: list[str], project_path: str) -> lis
     return errors
 
 
+def _as_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 def _validate_common_security(state: ResearchState) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -57,6 +70,9 @@ def _validate_common_security(state: ResearchState) -> tuple[list[str], list[str
 
     if state.get("requires_quantum") and not settings.QUANTUM_ENABLED:
         warnings.append("Quantum requested while QUANTUM_ENABLED=false")
+    execution_mode = str(state.get("execution_mode", "")).strip().lower()
+    if execution_mode not in {VSCODE_EXTENSION_MODE, BACKEND_MODE}:
+        warnings.append(f"Unknown execution_mode '{execution_mode}', default behavior may apply")
 
     return errors, warnings
 
@@ -82,6 +98,8 @@ def _validate_clarifier(state: ResearchState) -> tuple[list[str], list[str]]:
     total_planned = int(pending.get("total_questions_planned") or 0)
     if total_planned > 12:
         errors.append("Clarifier total_questions_planned exceeds hard cap (12)")
+    if total_planned <= 0:
+        errors.append("Clarifier total_questions_planned must be > 0")
 
     for q in [current_question]:
         if not isinstance(q, dict):
@@ -90,6 +108,12 @@ def _validate_clarifier(state: ResearchState) -> tuple[list[str], list[str]]:
         for required in ("id", "text", "type"):
             if required not in q:
                 errors.append(f"Question missing field: {required}")
+        qtype = str(q.get("type", "")).strip().lower()
+        if qtype not in ALLOWED_QUESTION_TYPES:
+            errors.append(f"Question has unsupported type: {q.get('type')}")
+        topic = str(q.get("topic", "")).strip()
+        if not topic:
+            errors.append("Question missing topic")
         if q.get("type") == "choice" and not q.get("options"):
             errors.append(f"Choice question missing options: {q.get('id')}")
     if current_question.get("id") in asked:
@@ -108,6 +132,24 @@ def _validate_planner(state: ResearchState) -> tuple[list[str], list[str]]:
         errors.append("Planner produced empty required_packages")
     if state.get("requires_quantum") and not state.get("quantum_framework"):
         warnings.append("Quantum required but framework not explicitly set")
+    clar = state.get("clarifications", {})
+    problem_type = str(plan.get("problem_type") or clar.get("problem_type") or "").strip().lower()
+    if not problem_type:
+        errors.append("Planner missing problem_type in research plan")
+    elif problem_type not in ALLOWED_PROBLEM_TYPES:
+        errors.append(f"Planner problem_type unsupported: {problem_type}")
+    code_level = str(plan.get("code_level") or clar.get("code_level") or "").strip().lower()
+    if not code_level:
+        errors.append("Planner missing code_level in research plan")
+    elif code_level not in ALLOWED_CODE_LEVELS:
+        errors.append(f"Planner code_level unsupported: {code_level}")
+    if state.get("dataset_source") == "kaggle" and not state.get("kaggle_dataset_id"):
+        warnings.append("Dataset source is kaggle but kaggle_dataset_id is empty")
+    if state.get("dataset_source") == "upload":
+        report = state.get("data_report", {})
+        source = report.get("source", {}) if isinstance(report, dict) else {}
+        if isinstance(source, dict) and source.get("resolved_source") == "synthetic":
+            warnings.append("Upload source fell back to synthetic dataset")
     return errors, warnings
 
 
@@ -119,9 +161,18 @@ def _validate_env(state: ResearchState) -> tuple[list[str], list[str]]:
     if waiting and not pending:
         errors.append("Env manager in waiting_user without pending_user_confirm")
     if pending:
-        for field in ("action_id", "action", "package", "version"):
+        for field in ("action_id", "action"):
             if field not in pending:
                 errors.append(f"Pending confirm missing {field}")
+        if "cwd" in pending:
+            errors.extend(_ensure_all_paths_within_project([str(pending.get("cwd", ""))], state["project_path"]))
+        if pending.get("action") == "install_package":
+            for field in ("package", "version"):
+                if field not in pending:
+                    errors.append(f"Pending install confirmation missing {field}")
+        if pending.get("action") in {"run_local_commands", "prepare_venv", "apply_file_operations", "install_package"}:
+            if not pending.get("command") and not pending.get("commands"):
+                warnings.append(f"Pending action {pending.get('action')} has no command payload")
     return errors, warnings
 
 
@@ -132,6 +183,18 @@ def _validate_dataset(state: ResearchState) -> tuple[list[str], list[str]]:
     for key in ("shape", "columns"):
         if key not in report:
             errors.append(f"Dataset report missing {key}")
+    shape = report.get("shape", [])
+    if not isinstance(shape, list) or len(shape) < 2:
+        errors.append("Dataset report shape must be [rows, cols]")
+    else:
+        try:
+            if int(shape[0]) <= 0:
+                errors.append("Dataset report has no rows")
+        except Exception:
+            errors.append("Dataset report shape[0] must be numeric")
+    source = report.get("source", {}) if isinstance(report, dict) else {}
+    if not isinstance(source, dict) or "requested_source" not in source or "resolved_source" not in source:
+        warnings.append("Dataset report missing source resolution metadata")
     dataset_path = state.get("dataset_path", "")
     if not dataset_path:
         errors.append("Dataset path not set")
@@ -156,9 +219,35 @@ def _validate_codegen(state: ResearchState) -> tuple[list[str], list[str]]:
         project / "src" / "train.py",
         project / "src" / "evaluate.py",
     ]
-    for path in required:
-        if not path.exists():
-            errors.append(f"Code generation missing file: {path.name}")
+    problem_type = str((state.get("research_plan") or {}).get("problem_type") or "").strip().lower()
+    if problem_type and problem_type not in ALLOWED_PROBLEM_TYPES:
+        errors.append(f"Codegen received unsupported problem_type: {problem_type}")
+    code_level = str((state.get("research_plan") or {}).get("code_level") or "").strip().lower()
+    if code_level and code_level not in ALLOWED_CODE_LEVELS:
+        errors.append(f"Codegen received unsupported code_level: {code_level}")
+    if is_vscode_execution_mode(state):
+        planned = {str(item.get("path", "")) for item in state.get("local_file_plan", [])}
+        for path in required:
+            if str(path) not in planned:
+                errors.append(f"Code generation missing planned file: {path.name}")
+        config_entry = next((item for item in state.get("local_file_plan", []) if str(item.get("path", "")).endswith("config.py")), None)
+        if isinstance(config_entry, dict):
+            content = str(config_entry.get("content", ""))
+            if "PROBLEM_TYPE" not in content:
+                errors.append("Code generation config.py missing PROBLEM_TYPE")
+            if "CODE_LEVEL" not in content:
+                errors.append("Code generation config.py missing CODE_LEVEL")
+    else:
+        for path in required:
+            if not path.exists():
+                errors.append(f"Code generation missing file: {path.name}")
+        config_file = project / "config.py"
+        if config_file.exists():
+            content = config_file.read_text(encoding="utf-8", errors="ignore")
+            if "PROBLEM_TYPE" not in content:
+                errors.append("Code generation config.py missing PROBLEM_TYPE")
+            if "CODE_LEVEL" not in content:
+                errors.append("Code generation config.py missing CODE_LEVEL")
     return errors, warnings
 
 
@@ -171,8 +260,16 @@ def _validate_quantum(state: ResearchState) -> tuple[list[str], list[str]]:
             errors.append("Quantum gate did not persist quantum_circuit_code")
         elif "class QuantumLayer" not in code:
             errors.append("Quantum circuit code missing QuantumLayer")
+        if "QUBIT_COUNT" not in code:
+            warnings.append("Quantum circuit code missing QUBIT_COUNT constant")
+        if "BACKEND" not in code:
+            warnings.append("Quantum circuit code missing BACKEND constant")
         path = Path(state["project_path"]) / "src" / "quantum_circuit.py"
-        if not path.exists():
+        if is_vscode_execution_mode(state):
+            planned = {str(item.get("path", "")) for item in state.get("local_file_plan", [])}
+            if str(path) not in planned:
+                errors.append("Quantum gate did not plan src/quantum_circuit.py")
+        elif not path.exists():
             errors.append("Quantum gate did not create src/quantum_circuit.py")
     return errors, warnings
 
@@ -183,6 +280,8 @@ def _validate_scheduler(state: ResearchState) -> tuple[list[str], list[str]]:
     order = state.get("execution_order", [])
     if not order:
         errors.append("Scheduler produced empty execution_order")
+    if order and not any(str(item).endswith("main.py") for item in order):
+        warnings.append("Scheduler execution_order does not include main.py")
     errors.extend(_ensure_all_paths_within_project(order, state["project_path"]))
     return errors, warnings
 
@@ -198,6 +297,11 @@ def _validate_runner(state: ResearchState) -> tuple[list[str], list[str]]:
     for key in ("script_path", "returncode", "stdout", "stderr", "duration_sec"):
         if key not in latest:
             errors.append(f"Execution log missing {key}")
+    duration = _as_float(latest.get("duration_sec"))
+    if duration is None or duration < 0:
+        errors.append("Execution log duration_sec must be >= 0")
+    if latest.get("returncode") is None:
+        errors.append("Execution log missing returncode value")
     if len(latest.get("stdout", "")) > settings.STDOUT_CAP_CHARS:
         errors.append("stdout exceeds cap")
     if len(latest.get("stderr", "")) > settings.STDERR_CAP_CHARS:
@@ -212,6 +316,8 @@ def _validate_error_recovery(state: ResearchState) -> tuple[list[str], list[str]
         errors.append("Error recovery exceeded retry cap")
     if state.get("errors") and not state.get("last_error_category"):
         warnings.append("Errors exist but last_error_category not set")
+    if state.get("retry_count", 0) > 0 and not state.get("repair_history"):
+        warnings.append("Retry count > 0 but repair_history is empty")
     return errors, warnings
 
 
@@ -223,6 +329,18 @@ def _validate_evaluator(state: ResearchState) -> tuple[list[str], list[str]]:
     summary = state.get("evaluation_summary", {})
     if "metrics" not in summary:
         warnings.append("Evaluation summary missing metrics section")
+    evaluation = (state.get("metrics") or {}).get("evaluation", {})
+    if not isinstance(evaluation, dict):
+        errors.append("Evaluator metrics.evaluation must be an object")
+        evaluation = {}
+    primary_name = str(state.get("target_metric") or "accuracy")
+    if primary_name not in evaluation:
+        warnings.append(f"Primary target metric '{primary_name}' missing from evaluation map")
+    else:
+        if _as_float(evaluation.get(primary_name)) is None:
+            errors.append(f"Primary target metric '{primary_name}' is not numeric")
+    if bool(state.get("requires_quantum")) and "quantum_benchmarks" not in (state.get("metrics") or {}):
+        warnings.append("Quantum run missing quantum_benchmarks in evaluator output")
     return errors, warnings
 
 
@@ -239,6 +357,11 @@ def _validate_doc(state: ResearchState) -> tuple[list[str], list[str]]:
         errors.append("documentation_path outside project")
     if not Path(doc_path).exists():
         errors.append("final report file missing")
+        return errors, warnings
+    report_text = Path(doc_path).read_text(encoding="utf-8", errors="ignore")
+    for section in ["# Abstract", "## Research Objective", "## Experimental Results", "## Conclusion & Interpretation"]:
+        if section not in report_text:
+            warnings.append(f"Final report missing section marker: {section}")
     return errors, warnings
 
 

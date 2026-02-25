@@ -40,7 +40,7 @@ Clarifier is now one-question-at-a-time.
 - `pending_questions.answered`: answered history
 
 `POST /research/{experiment_id}/answer` accepts exactly one answer each call.
-The next question is generated after each answer; the backend does not pre-create the full question list.
+The backend keeps a dynamic question plan generated from the prompt and advances one question at a time.
 
 ---
 
@@ -54,8 +54,11 @@ The next question is generated after each answer; the backend does not pre-creat
 ```json
 {
   "prompt": "Build a hybrid quantum-classical classifier",
+  "research_type": "quantum",
   "priority": "normal",
   "tags": ["quantum", "classification"],
+  "user_id": "alice",
+  "test_mode": false,
   "config_overrides": {
     "random_seed": 42,
     "hardware_target": "cpu",
@@ -71,15 +74,18 @@ The next question is generated after each answer; the backend does not pre-creat
   "experiment_id": "exp_20260224_ab12cd",
   "status": "waiting_user",
   "phase": "clarifier",
+  "research_type": "quantum",
+  "research_scope": {"user_id": "alice", "test_mode": false, "collection_key": "user:alice"},
   "execution_target": "local_machine",
-  "llm": {"provider": "rule_based", "model": "deterministic-orchestrator"},
+  "execution_mode": "vscode_extension",
+  "llm": {"provider": "quantum_llm", "model": "quantum_local_template"},
   "pending_questions": {
     "mode": "sequential_dynamic",
-    "current_question": {"id": "Q1", "text": "...", "type": "choice", "options": [".py", ".ipynb"]},
-    "questions": [{"id": "Q1", "text": "...", "type": "choice", "options": [".py", ".ipynb"]}],
+    "current_question": {"id": "Q1", "topic": "output_format", "text": "...", "type": "choice", "options": [".py", ".ipynb"]},
+    "questions": [{"id": "Q1", "topic": "output_format", "text": "...", "type": "choice", "options": [".py", ".ipynb"]}],
     "asked_question_ids": [],
     "answered_count": 0,
-    "total_questions_planned": 0
+    "total_questions_planned": 7
   }
 }
 ```
@@ -106,6 +112,7 @@ The next question is generated after each answer; the backend does not pre-creat
 ```json
 {
   "experiment_id": "exp_20260224_ab12cd",
+  "research_type": "quantum",
   "answers_received": 1,
   "answered_question_ids": ["Q1"],
   "status": "waiting_user",
@@ -144,9 +151,20 @@ The next question is generated after each answer; the backend does not pre-creat
   "action_id": "act_1234abcd",
   "decision": "confirm",
   "reason": "Approve install",
-  "alternative_preference": ""
+  "alternative_preference": "",
+  "execution_result": {
+    "returncode": 0,
+    "stdout": "...",
+    "stderr": "",
+    "duration_sec": 1.1,
+    "command": ["python", "-m", "pip", "install", "numpy==1.26.4"],
+    "cwd": "C:/.../exp_...",
+    "created_files": []
+  }
 }
 ```
+
+Note: for local actions (`apply_file_operations`, `prepare_venv`, `install_package`, `run_local_commands`), send `execution_result` when `decision="confirm"`.
 
 ### Response `data`
 
@@ -176,6 +194,7 @@ The next question is generated after each answer; the backend does not pre-creat
   "status": "success",
   "phase": "finished",
   "execution_target": "local_machine",
+  "execution_mode": "vscode_extension",
   "llm": {"provider": "huggingface", "model": "Qwen/Qwen2.5-7B-Instruct"},
   "created_files": [],
   "metrics": {}
@@ -199,11 +218,23 @@ The next question is generated after each answer; the backend does not pre-creat
   "waiting_for_user": false,
   "pending_action": null,
   "execution_target": "local_machine",
+  "execution_mode": "vscode_extension",
   "llm_provider": "rule_based",
-  "llm_model": "deterministic-orchestrator",
+  "llm_model": "local_structured_fallback",
   "progress_pct": 85
 }
 ```
+
+When waiting for local execution, `pending_action` includes:
+- `commands`: command array to run on user device
+- `cwd`: working directory
+- `file_operations`: files the extension should create/update before running commands
+- `timeout_seconds`
+- `action_id` used in `/confirm`
+- `action` can be:
+  - `apply_file_operations` (dataset/codegen/quantum phases)
+  - `prepare_venv` / `install_package` (env phase)
+  - `run_local_commands` (execution phase)
 
 ---
 
@@ -338,6 +369,47 @@ Includes:
 - llm usage distribution
 - RL feedback aggregates
 - execution target (`local_machine`)
+
+---
+
+## 12) Chat Endpoints (History-Aware Research Copilot)
+
+Chat endpoint answers user questions using scoped research history:
+- `test_mode=true`: reads from unified test collection (`test:unified`)
+- `test_mode=false`: reads user-scoped collection (`user:<user_id>`)
+
+### Ask Chat Assistant
+`POST /chat/research`
+
+Request:
+```json
+{
+  "message": "How should I improve preprocessing and plots?",
+  "user_id": "alice",
+  "test_mode": false,
+  "context_limit": 5
+}
+```
+
+Response `data` (key fields):
+```json
+{
+  "answer": "....",
+  "follow_up_questions": ["..."],
+  "scope": {"user_id": "alice", "test_mode": false, "collection_key": "user:alice"},
+  "retrieval": {
+    "history_source": "collection",
+    "history_loaded": 3,
+    "history_used": 3,
+    "references": [{"experiment_id": "exp_..."}]
+  },
+  "generation": {"provider": "rule_based", "strategy": "history_aware_local_fallback"},
+  "token_usage": {"prompt_tokens": 21, "completion_tokens": 75, "total_tokens": 96}
+}
+```
+
+### Read Chat History
+`GET /chat/history?user_id=alice&test_mode=false&limit=40`
 
 ---
 

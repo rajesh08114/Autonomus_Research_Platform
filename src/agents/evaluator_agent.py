@@ -63,12 +63,31 @@ async def evaluator_agent_node(state: ResearchState) -> ResearchState:
             "training": {"duration_sec": 0.0, "final_loss": 1.0, "epochs": state.get("max_epochs", 0)},
         }
 
+    if not isinstance(metrics, dict):
+        metrics = {
+            "experiment_id": state["experiment_id"],
+            "evaluation": {state["target_metric"]: 0.0},
+            "training": {"duration_sec": 0.0, "final_loss": 1.0, "epochs": state.get("max_epochs", 0)},
+        }
+    evaluation_map = metrics.get("evaluation")
+    if not isinstance(evaluation_map, dict):
+        evaluation_map = {}
+        metrics["evaluation"] = evaluation_map
+    if state["target_metric"] not in evaluation_map:
+        fallback_value = float(evaluation_map.get("accuracy", 0.0))
+        evaluation_map[state["target_metric"]] = fallback_value
+
     if state.get("requires_quantum"):
         qb = _quantum_benchmarks(state, metrics)
         metrics["quantum_benchmarks"] = qb
         evaluation = metrics.setdefault("evaluation", {})
         if isinstance(evaluation, dict):
             evaluation["quantum_fidelity"] = float(qb.get("fidelity_benchmark", 0.0))
+
+    artifacts = metrics.get("artifacts", {}) if isinstance(metrics, dict) else {}
+    if isinstance(artifacts, dict):
+        plots = artifacts.get("plots", [])
+        state["plots_generated"] = [str(item) for item in plots] if isinstance(plots, list) else []
 
     state["metrics"] = metrics
     if settings.METRICS_TABLE_ENABLED:

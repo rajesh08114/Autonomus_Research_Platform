@@ -55,7 +55,7 @@ async def get_phase_policy_hint(phase: str) -> str:
     if stats.positive_rate < 0.4:
         return (
             "Policy: low positive reward rate detected. Slow down decisions, "
-            "explicitly validate assumptions, and prefer safe deterministic fallbacks."
+            "explicitly validate assumptions, and prefer safe fallback strategies."
         )
     if stats.avg_reward < 0.2:
         return (
@@ -65,7 +65,7 @@ async def get_phase_policy_hint(phase: str) -> str:
     if stats.avg_reward < 0.6:
         return (
             "Policy: moderate performance. Improve validation rigor, reduce ambiguity, "
-            "and include deterministic defaults before advancing phases."
+            "and include explicit user-aligned defaults before advancing phases."
         )
     return (
         "Policy: stable performance. Maintain strict validation and keep responses concise, "

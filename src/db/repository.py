@@ -33,6 +33,40 @@ class ExperimentRepository:
         return value.value if hasattr(value, "value") else str(value)
 
     @staticmethod
+    def _ensure_collection_tables(conn: Any) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS research_collections (
+                id                  TEXT PRIMARY KEY,
+                experiment_id       TEXT NOT NULL,
+                collection_key      TEXT NOT NULL,
+                user_id             TEXT,
+                test_mode           BOOLEAN DEFAULT FALSE,
+                metadata_json       TEXT,
+                created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id                  TEXT PRIMARY KEY,
+                collection_key      TEXT NOT NULL,
+                user_id             TEXT,
+                test_mode           BOOLEAN DEFAULT FALSE,
+                role                TEXT NOT NULL,
+                message             TEXT NOT NULL,
+                metadata_json       TEXT,
+                created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_research_collections_unique
+            ON research_collections(experiment_id, collection_key);
+            CREATE INDEX IF NOT EXISTS idx_research_collections_key ON research_collections(collection_key);
+            CREATE INDEX IF NOT EXISTS idx_research_collections_user ON research_collections(user_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_history_collection ON chat_history(collection_key);
+            CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id);
+            """
+        )
+
+    @staticmethod
     async def create(state: ResearchState) -> None:
         conn = get_connection()
         try:
@@ -126,7 +160,156 @@ class ExperimentRepository:
             conn.execute("DELETE FROM experiments WHERE id=?", (experiment_id,))
             conn.execute("DELETE FROM experiment_logs WHERE experiment_id=?", (experiment_id,))
             conn.execute("DELETE FROM experiment_metrics WHERE experiment_id=?", (experiment_id,))
+            conn.execute("DELETE FROM research_collections WHERE experiment_id=?", (experiment_id,))
             conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def add_to_collection(
+        experiment_id: str,
+        collection_key: str,
+        user_id: str,
+        test_mode: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        conn = get_connection()
+        try:
+            ExperimentRepository._ensure_collection_tables(conn)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO research_collections (
+                    id, experiment_id, collection_key, user_id, test_mode, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"col_{uuid.uuid4().hex[:12]}",
+                    experiment_id,
+                    collection_key,
+                    user_id,
+                    int(bool(test_mode)),
+                    json.dumps(metadata or {}),
+                ),
+            )
+            conn.commit()
+            logger.info(
+                "db.collection.add",
+                experiment_id=experiment_id,
+                collection_key=collection_key,
+                user_id=user_id,
+                test_mode=test_mode,
+            )
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def get_collection_states(collection_key: str, limit: int = 20) -> list[ResearchState]:
+        conn = get_connection()
+        try:
+            ExperimentRepository._ensure_collection_tables(conn)
+            rows = conn.execute(
+                """
+                SELECT e.state_json
+                FROM research_collections rc
+                JOIN experiments e ON e.id = rc.experiment_id
+                WHERE rc.collection_key=?
+                ORDER BY rc.created_at DESC
+                LIMIT ?
+                """,
+                (collection_key, limit),
+            ).fetchall()
+            output: list[ResearchState] = []
+            for row in rows:
+                raw = row["state_json"]
+                if not raw:
+                    continue
+                output.append(json.loads(raw))
+            return output
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def get_recent_states(limit: int = 20) -> list[ResearchState]:
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT state_json
+                FROM experiments
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            output: list[ResearchState] = []
+            for row in rows:
+                raw = row["state_json"]
+                if not raw:
+                    continue
+                output.append(json.loads(raw))
+            return output
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def add_chat_message(
+        collection_key: str,
+        user_id: str,
+        test_mode: bool,
+        role: str,
+        message: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        conn = get_connection()
+        try:
+            ExperimentRepository._ensure_collection_tables(conn)
+            conn.execute(
+                """
+                INSERT INTO chat_history (
+                    id, collection_key, user_id, test_mode, role, message, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"chat_{uuid.uuid4().hex[:12]}",
+                    collection_key,
+                    user_id,
+                    int(bool(test_mode)),
+                    role,
+                    message,
+                    json.dumps(metadata or {}),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def get_chat_history(collection_key: str, limit: int = 40) -> list[dict[str, Any]]:
+        conn = get_connection()
+        try:
+            ExperimentRepository._ensure_collection_tables(conn)
+            rows = conn.execute(
+                """
+                SELECT role, message, metadata_json, created_at
+                FROM chat_history
+                WHERE collection_key=?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (collection_key, limit),
+            ).fetchall()
+            output: list[dict[str, Any]] = []
+            for row in rows:
+                output.append(
+                    {
+                        "role": row["role"],
+                        "message": row["message"],
+                        "metadata": json.loads(row["metadata_json"] or "{}"),
+                        "timestamp": row["created_at"],
+                    }
+                )
+            output.reverse()
+            return output
         finally:
             conn.close()
 

@@ -8,14 +8,30 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import uuid
 
 from src.config.settings import settings
+from src.core.execution_mode import is_vscode_execution_mode, local_python_command
 from src.core.logger import get_logger
 from src.core.security import ensure_project_path, sanitize_subprocess_args
 from src.db.repository import ExperimentRepository
-from src.state.research_state import ExecutionLog, ResearchState
+from src.state.research_state import ExperimentStatus, ResearchState
 
 logger = get_logger(__name__)
+
+
+def _dedupe_local_file_plan(state: ResearchState) -> list[dict[str, str]]:
+    latest_by_path: dict[str, dict[str, str]] = {}
+    for item in state.get("local_file_plan", []):
+        path = str(item.get("path", "")).strip()
+        if not path:
+            continue
+        latest_by_path[path] = {
+            "path": path,
+            "content": str(item.get("content", "")),
+            "phase": str(item.get("phase", "unknown")),
+        }
+    return list(latest_by_path.values())
 
 
 def _should_inject_failure(point: str) -> bool:
@@ -114,8 +130,44 @@ async def subprocess_runner_node(state: ResearchState) -> ResearchState:
     state["current_script"] = script
     logger.info("subprocess.run.start", experiment_id=state["experiment_id"], script=script, idx=idx)
     ensure_project_path(script, state["project_path"])
-
     project_path = Path(state["project_path"]).resolve()
+
+    if is_vscode_execution_mode(state):
+        local_python = local_python_command()
+        file_plan = _dedupe_local_file_plan(state)
+        materialized = set(state.get("local_materialized_files", []))
+        materialize = [item for item in file_plan if item["path"] not in materialized]
+        command = [local_python, script]
+        state["pending_user_confirm"] = {
+            "action_id": f"act_{uuid.uuid4().hex[:8]}",
+            "action": "run_local_commands",
+            "phase": "subprocess_runner",
+            "script_path": script,
+            "cwd": str(project_path),
+            "commands": command,
+            "timeout_seconds": int(settings.SUBPROCESS_TIMEOUT),
+            "file_operations": materialize,
+            "created_files": [item["path"] for item in materialize],
+            "reason": "Create project files locally and run the script in the user Python environment",
+            "next_phase": "subprocess_runner",
+        }
+        state["status"] = ExperimentStatus.WAITING.value
+        state["confirmations_requested"] = int(state.get("confirmations_requested", 0)) + 1
+        await ExperimentRepository.add_log(
+            state["experiment_id"],
+            "subprocess_runner",
+            "info",
+            "Local execution requested via VS Code extension",
+            {
+                "script_path": script,
+                "commands": command,
+                "cwd": str(project_path),
+                "planned_file_count": len(materialize),
+                "execution_mode": "vscode_extension",
+            },
+        )
+        return state
+
     log_path = project_path / "logs" / f"{Path(script).stem}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -55,6 +55,23 @@ class DenialRecord(TypedDict):
     timestamp: float
 
 
+class LocalFilePlanItem(TypedDict):
+    path: str
+    content: str
+    phase: str
+
+
+class LocalActionResult(TypedDict):
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_sec: float
+    command: list[str]
+    cwd: str
+    created_files: list[str]
+    metadata: dict[str, Any]
+
+
 class ResearchState(TypedDict):
     experiment_id: str
     project_path: str
@@ -65,6 +82,7 @@ class ResearchState(TypedDict):
     timestamp_end: Optional[float]
 
     user_prompt: str
+    research_type: str
     clarifications: dict[str, Any]
     research_plan: dict[str, Any]
 
@@ -80,6 +98,7 @@ class ResearchState(TypedDict):
     required_packages: list[str]
     installed_packages: list[str]
     venv_path: str
+    venv_ready: bool
     output_format: str
 
     dataset_source: str
@@ -123,9 +142,17 @@ class ResearchState(TypedDict):
     llm_provider: str
     llm_model: str
     execution_target: str
+    execution_mode: str
     confirmations_requested: int
     confirmations_processed: int
     phase_timings: dict[str, float]
+    research_user_id: str
+    test_mode: bool
+    collection_key: str
+    local_file_plan: list[LocalFilePlanItem]
+    local_materialized_files: list[str]
+    local_action_history: list[dict[str, Any]]
+    last_local_action_result: Optional[LocalActionResult]
 
 
 def new_research_state(experiment_id: str, project_path: str, prompt: str, overrides: dict[str, Any]) -> ResearchState:
@@ -137,6 +164,7 @@ def new_research_state(experiment_id: str, project_path: str, prompt: str, overr
         timestamp_start=time.time(),
         timestamp_end=None,
         user_prompt=prompt,
+        research_type=str(overrides.get("research_type", "ai")),
         clarifications={},
         research_plan={},
         requires_quantum=False,
@@ -150,6 +178,7 @@ def new_research_state(experiment_id: str, project_path: str, prompt: str, overr
         required_packages=[],
         installed_packages=[],
         venv_path=f"{project_path}/.venv",
+        venv_ready=False,
         output_format=str(overrides.get("output_format", ".py")),
         dataset_source=str(overrides.get("dataset_source", "sklearn")),
         dataset_path=f"{project_path}/data/raw",
@@ -184,7 +213,15 @@ def new_research_state(experiment_id: str, project_path: str, prompt: str, overr
         llm_provider="",
         llm_model="",
         execution_target="local_machine",
+        execution_mode=str(overrides.get("execution_mode", "vscode_extension")),
         confirmations_requested=0,
         confirmations_processed=0,
         phase_timings={},
+        research_user_id=str(overrides.get("user_id", "anonymous")),
+        test_mode=bool(overrides.get("test_mode", False)),
+        collection_key=str(overrides.get("collection_key", "user:anonymous")),
+        local_file_plan=[],
+        local_materialized_files=[],
+        local_action_history=[],
+        last_local_action_result=None,
     )

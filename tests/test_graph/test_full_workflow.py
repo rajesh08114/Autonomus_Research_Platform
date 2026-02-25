@@ -15,17 +15,17 @@ async def test_end_to_end(tmp_path, monkeypatch):
     state = await get_experiment_or_404(experiment_id)
     assert state["pending_user_question"] is not None
 
-    answer_defaults = {
-        "Q1": ".py",
-        "Q2": "supervised",
-        "Q3": False,
-        "Q4": "pennylane",
-        "Q5": "synthetic",
-        "Q6": "owner/dataset",
-        "Q7": "accuracy",
-        "Q8": "cpu",
-        "Q10": 42,
-        "Q11": 20,
+    topic_defaults = {
+        "output_format": ".py",
+        "algorithm_class": "supervised",
+        "requires_quantum": False,
+        "quantum_framework": "pennylane",
+        "dataset_source": "synthetic",
+        "kaggle_dataset_id": "owner/dataset",
+        "target_metric": "accuracy",
+        "hardware_target": "cpu",
+        "random_seed": 42,
+        "max_epochs": 20,
     }
     while state.get("status") == "waiting_user" and state.get("pending_user_question"):
         pending = state.get("pending_user_question") or {}
@@ -35,8 +35,22 @@ async def test_end_to_end(tmp_path, monkeypatch):
             current = questions[0] if questions else None
         assert isinstance(current, dict)
         qid = current.get("id")
-        assert qid in answer_defaults
-        state = await submit_answers(experiment_id, {qid: answer_defaults[qid]})
+        topic = str(current.get("topic", "")).strip().lower()
+        answer = topic_defaults.get(topic)
+        if answer is None:
+            default = current.get("default")
+            if default is not None:
+                answer = default
+            elif current.get("type") == "choice":
+                options = current.get("options") or []
+                answer = options[0] if options else "auto"
+            elif current.get("type") == "boolean":
+                answer = False
+            elif current.get("type") == "number":
+                answer = 1
+            else:
+                answer = "auto"
+        state = await submit_answers(experiment_id, {qid: answer})
 
     assert state["phase"] in {
         "planner",

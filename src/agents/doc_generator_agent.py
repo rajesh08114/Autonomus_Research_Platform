@@ -12,6 +12,11 @@ logger = get_logger(__name__)
 def _build_report(state: ResearchState) -> str:
     metrics = state.get("metrics", {})
     evaluation = metrics.get("evaluation", {})
+    artifacts = metrics.get("artifacts", {}) if isinstance(metrics, dict) else {}
+    preprocessing = metrics.get("preprocessing", {}) if isinstance(metrics, dict) else {}
+    research_plan = state.get("research_plan", {})
+    problem_type = research_plan.get("problem_type", "classification")
+    code_level = research_plan.get("code_level", "intermediate")
     sections = [
         "# Abstract",
         f"Experiment `{state['experiment_id']}` executed for objective: {state['user_prompt']}.",
@@ -25,17 +30,25 @@ def _build_report(state: ResearchState) -> str:
         json.dumps(state.get("data_report", {}), indent=2),
         "## Model Architecture",
         state["research_plan"].get("algorithm", "N/A"),
+        "## User Requirement Mapping",
+        f"- Problem type: {problem_type}\n- Code level: {code_level}\n- Research type: {state.get('research_type', 'ai')}",
         "## Training Configuration",
         f"- Seed: {state['random_seed']}\n- Epochs: {state.get('max_epochs')}\n- Batch size: {state.get('batch_size')}",
         "## Experimental Results",
         "| Metric | Value |\n|---|---|\n"
         + "\n".join(f"| {k} | {v} |" for k, v in evaluation.items()),
+        "## Data Preprocessing Summary",
+        json.dumps(preprocessing, indent=2),
+        "## Generated Plots & Artifacts",
+        json.dumps(artifacts, indent=2),
         "## Error Incidents & Resolutions",
         json.dumps(state.get("repair_history", []), indent=2),
         "## Reproducibility Guide",
         "1. Install dependencies\n2. Run `python main.py`\n3. Compare outputs/metrics.json",
         "## Conclusion & Interpretation",
         f"Primary metric `{state['target_metric']}` = {evaluation.get(state['target_metric'], 'N/A')}.",
+        "## LLM Usage Summary",
+        f"- Total tokens: {state.get('total_tokens_used', 0)}\n- Cost controls: disabled",
         "## Future Work",
         "1. Hyperparameter tuning\n2. Real-world dataset expansion\n3. Quantum backend benchmark",
         "## Appendix: Full State Snapshot",
