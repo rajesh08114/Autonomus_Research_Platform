@@ -181,6 +181,46 @@ Note: for local actions (`apply_file_operations`, `prepare_venv`, `install_packa
 
 ---
 
+## 3b) Update Selected Fields On Existing Experiment
+
+Use this when a user wants to change only specific fields on an already-created experiment.
+
+### Endpoint
+`PATCH /research/{experiment_id}`
+
+### Request Body
+
+```json
+{
+  "updates": {
+    "target_metric": "f1_macro",
+    "framework": "xgboost",
+    "research_plan": {"problem_type": "classification"}
+  },
+  "merge_nested": true
+}
+```
+
+Notes:
+- `updates` is an allowlisted partial update payload.
+- Nested dict fields (`research_plan`, `clarifications`) are merged when `merge_nested=true`.
+- Running experiments reject updates with `409` to avoid state races.
+
+### Response `data` (key fields)
+
+```json
+{
+  "experiment_id": "exp_20260224_ab12cd",
+  "status": "waiting_user",
+  "phase": "clarifier",
+  "updated_fields": ["framework", "research_plan", "target_metric"],
+  "applied_updates": {"framework": "xgboost", "target_metric": "f1_macro"},
+  "rejected_fields": {}
+}
+```
+
+---
+
 ## 4) Experiment Details
 
 ### Endpoint

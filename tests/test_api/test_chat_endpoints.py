@@ -108,3 +108,31 @@ async def test_chat_history_persisted(client):
     roles = [item["role"] for item in body["messages"]]
     assert roles.count("user") >= 2
     assert roles.count("assistant") >= 2
+
+
+@pytest.mark.asyncio
+async def test_chat_general_question_can_skip_history_retrieval(client):
+    start = await client.post(
+        "/api/v1/research/start",
+        json={
+            "prompt": "Build an experiment used to test general chat fallback behavior",
+            "user_id": "general-user",
+            "test_mode": False,
+            "config_overrides": {},
+        },
+    )
+    assert start.status_code == 201
+
+    chat = await client.post(
+        "/api/v1/chat/research",
+        json={
+            "message": "What is gradient descent?",
+            "user_id": "general-user",
+            "test_mode": False,
+            "context_limit": 5,
+        },
+    )
+    assert chat.status_code == 200
+    payload = chat.json()["data"]
+    assert payload["retrieval"]["history_used"] == 0
+    assert payload["retrieval"]["references"] == []

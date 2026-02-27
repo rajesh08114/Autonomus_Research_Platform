@@ -40,6 +40,40 @@ logger = get_logger(__name__)
 
 _RUN_SEMAPHORE = asyncio.Semaphore(max(1, int(settings.MAX_CONCURRENT_EXPS)))
 _RUN_TASKS: dict[str, asyncio.Task] = {}
+_PATCHABLE_FIELDS = {
+    "user_prompt",
+    "research_type",
+    "framework",
+    "dataset_source",
+    "target_metric",
+    "hardware_target",
+    "output_format",
+    "max_epochs",
+    "batch_size",
+    "random_seed",
+    "kaggle_dataset_id",
+    "clarifications",
+    "research_plan",
+    "requires_quantum",
+    "quantum_framework",
+    "quantum_algorithm",
+    "quantum_backend",
+    "quantum_qubit_count",
+}
+_PATCHABLE_STR_FIELDS = {
+    "user_prompt",
+    "research_type",
+    "framework",
+    "dataset_source",
+    "target_metric",
+    "hardware_target",
+    "output_format",
+    "kaggle_dataset_id",
+    "quantum_framework",
+    "quantum_algorithm",
+    "quantum_backend",
+}
+_PATCHABLE_INT_FIELDS = {"max_epochs", "batch_size", "random_seed", "quantum_qubit_count"}
 
 
 def _new_experiment_id() -> str:
@@ -113,6 +147,13 @@ def _bool_from_value(value: Any) -> bool | None:
         return True
     if text in {"0", "false", "no", "n", "off", "disabled", "disable"}:
         return False
+    return None
+
+
+def _normalize_patch_choice(value: str, allowed: set[str]) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in allowed:
+        return normalized
     return None
 
 
@@ -654,6 +695,124 @@ async def retry_experiment(
         _schedule_background_run(experiment_id)
         return state
     return await run_until_blocked(state)
+
+
+async def update_experiment_fields(
+    experiment_id: str,
+    updates: dict[str, Any],
+    merge_nested: bool = True,
+) -> tuple[ResearchState, dict[str, Any], dict[str, str]]:
+    state = await ExperimentRepository.get(experiment_id)
+    if not state:
+        raise ValueError("Experiment not found")
+
+    status_value = str(state.get("status") or "")
+    if status_value == ExperimentStatus.RUNNING.value:
+        raise RuntimeError("Experiment is running; wait until it is blocked before updating fields")
+
+    applied: dict[str, Any] = {}
+    rejected: dict[str, str] = {}
+    for key, raw_value in (updates or {}).items():
+        if key not in _PATCHABLE_FIELDS:
+            rejected[key] = "field_not_patchable"
+            continue
+
+        if key in _PATCHABLE_STR_FIELDS:
+            value = str(raw_value or "").strip()
+            if key == "user_prompt":
+                if len(value) < 10:
+                    rejected[key] = "prompt_too_short"
+                    continue
+                value = value[:2000]
+            elif key == "research_type":
+                normalized = _normalize_patch_choice(value, {"ai", "quantum"})
+                if normalized is None:
+                    rejected[key] = "unsupported_value"
+                    continue
+                value = normalized
+            elif key == "dataset_source":
+                normalized = _normalize_patch_choice(value, {"synthetic", "sklearn", "upload", "kaggle"})
+                if normalized is None:
+                    rejected[key] = "unsupported_value"
+                    continue
+                value = normalized
+            elif key == "output_format":
+                normalized = _normalize_patch_choice(value, {".py", ".ipynb"})
+                if normalized is None:
+                    rejected[key] = "unsupported_value"
+                    continue
+                value = normalized
+            elif key == "framework":
+                value = value[:80]
+            elif key in {"target_metric", "hardware_target", "kaggle_dataset_id", "quantum_framework", "quantum_algorithm", "quantum_backend"}:
+                value = value[:120]
+            state[key] = value
+            applied[key] = value
+            continue
+
+        if key in _PATCHABLE_INT_FIELDS:
+            try:
+                value = int(raw_value)
+            except Exception:
+                rejected[key] = "expected_integer"
+                continue
+            if key == "max_epochs":
+                value = max(1, min(value, 10000))
+            elif key == "batch_size":
+                value = max(1, min(value, 4096))
+            elif key == "random_seed":
+                value = max(0, min(value, 2_147_483_647))
+            elif key == "quantum_qubit_count":
+                value = max(1, min(value, 128))
+            state[key] = value
+            applied[key] = value
+            continue
+
+        if key in {"clarifications", "research_plan"}:
+            if not isinstance(raw_value, dict):
+                rejected[key] = "expected_object"
+                continue
+            if merge_nested:
+                merged = dict(state.get(key) or {})
+                merged.update(raw_value)
+                state[key] = merged
+            else:
+                state[key] = dict(raw_value)
+            applied[key] = state[key]
+            continue
+
+        if key == "requires_quantum":
+            parsed = _bool_from_value(raw_value)
+            if parsed is None:
+                rejected[key] = "expected_boolean"
+                continue
+            state[key] = parsed
+            applied[key] = parsed
+            continue
+
+        rejected[key] = "unsupported_value"
+
+    if not applied:
+        return state, applied, rejected
+
+    if "research_type" in applied:
+        if str(state.get("research_type") or "ai").strip().lower() == "quantum":
+            state["requires_quantum"] = True
+            applied["requires_quantum"] = True
+        elif "requires_quantum" not in applied:
+            state["requires_quantum"] = False
+            applied["requires_quantum"] = False
+
+    state["total_duration_sec"] = max(0.0, time.time() - float(state.get("timestamp_start") or time.time()))
+    await ExperimentRepository.update(experiment_id, state)
+    await ExperimentRepository.add_log(
+        experiment_id,
+        "system",
+        "info",
+        "Experiment fields updated",
+        {"applied_fields": sorted(applied.keys()), "rejected_fields": rejected},
+    )
+    return state, applied, rejected
 
 
 async def get_experiment_or_404(experiment_id: str) -> ResearchState:

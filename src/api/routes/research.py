@@ -19,8 +19,9 @@ from src.graph.runner import (
     submit_answers,
     submit_confirmation,
     summarize_for_list,
+    update_experiment_fields,
 )
-from src.schemas.request_schemas import AbortRequest, AnswerRequest, ConfirmRequest, RetryRequest, StartResearchRequest
+from src.schemas.request_schemas import AbortRequest, AnswerRequest, ConfirmRequest, RetryRequest, StartResearchRequest, UpdateResearchRequest
 from src.schemas.response_schemas import error_payload, response_envelope
 
 router = APIRouter()
@@ -132,6 +133,48 @@ async def post_confirm(experiment_id: str, request: ConfirmRequest, request_id: 
     return response_envelope(True, data=data, request_id=request_id)
 
 
+@router.patch("/research/{experiment_id}")
+async def patch_research(experiment_id: str, request: UpdateResearchRequest, request_id: str = Depends(get_request_id)):
+    logger.info(
+        "api.research.patch",
+        request_id=request_id,
+        experiment_id=experiment_id,
+        update_keys=sorted((request.updates or {}).keys()),
+        merge_nested=request.merge_nested,
+    )
+    try:
+        state, applied, rejected = await update_experiment_fields(
+            experiment_id=experiment_id,
+            updates=request.updates,
+            merge_nested=bool(request.merge_nested),
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail=error_payload("EXPERIMENT_NOT_FOUND", f"Experiment {experiment_id} does not exist"))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=error_payload("WRONG_STATUS", str(exc)))
+
+    if not applied:
+        raise HTTPException(
+            status_code=400,
+            detail=error_payload(
+                "INVALID_UPDATE_FIELDS",
+                "No valid updates were applied.",
+                details={"rejected_fields": rejected},
+            ),
+        )
+
+    data = {
+        "experiment_id": experiment_id,
+        "status": state["status"],
+        "phase": state["phase"],
+        "research_type": state.get("research_type", "ai"),
+        "updated_fields": sorted(applied.keys()),
+        "applied_updates": applied,
+        "rejected_fields": rejected,
+    }
+    return response_envelope(True, data=data, request_id=request_id)
+
+
 @router.get("/research/{experiment_id}")
 async def get_research(experiment_id: str, request_id: str = Depends(get_request_id)):
     logger.info("api.research.get", request_id=request_id, experiment_id=experiment_id)
@@ -152,6 +195,7 @@ async def get_research(experiment_id: str, request_id: str = Depends(get_request
         "quantum_framework": state["quantum_framework"],
         "framework": state["framework"],
         "dataset_source": state["dataset_source"],
+        "target_metric": state["target_metric"],
         "hardware_target": state["hardware_target"],
         "retry_count": state["retry_count"],
         "llm_calls_count": state.get("llm_calls_count", 0),

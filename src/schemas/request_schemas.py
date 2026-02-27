@@ -39,6 +39,11 @@ class RetryRequest(BaseModel):
     override_config: dict[str, Any] = Field(default_factory=dict)
 
 
+class UpdateResearchRequest(BaseModel):
+    updates: dict[str, Any] = Field(min_length=1, max_length=25)
+    merge_nested: bool = True
+
+
 class ChatResearchRequest(BaseModel):
     message: str = Field(min_length=3, max_length=4000)
     user_id: str | None = Field(default=None, max_length=64)

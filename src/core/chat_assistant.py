@@ -28,6 +28,27 @@ def _keyword_set(text: str) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9_]+", (text or "").lower()) if len(token) >= 3}
 
 
+def _is_history_intent(question: str) -> bool:
+    terms = _keyword_set(question)
+    markers = {
+        "research",
+        "experiment",
+        "experiments",
+        "history",
+        "previous",
+        "before",
+        "result",
+        "results",
+        "metric",
+        "metrics",
+        "dataset",
+        "project",
+        "run",
+        "runs",
+    }
+    return any(marker in terms for marker in markers)
+
+
 def state_to_summary(state: dict[str, Any]) -> dict[str, Any]:
     evaluation = ((state.get("metrics") or {}).get("evaluation") or {}) if isinstance(state.get("metrics"), dict) else {}
     target_metric = str(state.get("target_metric") or "accuracy")
@@ -47,6 +68,8 @@ def state_to_summary(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def select_relevant_history(question: str, history: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if not history:
+        return []
     terms = _keyword_set(question)
     scored: list[tuple[int, int, dict[str, Any]]] = []
     for idx, item in enumerate(history):
@@ -62,10 +85,12 @@ def select_relevant_history(question: str, history: list[dict[str, Any]], limit:
         score = sum(1 for term in terms if term in haystack)
         scored.append((score, -idx, item))
     scored.sort(reverse=True, key=lambda row: (row[0], row[1]))
-    selected = [row[2] for row in scored[:limit]]
+    selected = [row[2] for row in scored if row[0] > 0][:limit]
     if selected:
         return selected
-    return history[:limit]
+    if _is_history_intent(question):
+        return history[:limit]
+    return []
 
 
 def _history_to_text(selected: list[dict[str, Any]]) -> str:
@@ -88,13 +113,15 @@ async def _invoke_huggingface_chat(
     url = f"{settings.huggingface_inference_url}/chat/completions"
     model = settings.huggingface_model_id
     history_text = _history_to_text(selected)
+    has_retrieved_context = bool(selected)
     recent_messages = chat_history[-6:]
     messages: list[dict[str, str]] = [
         {
             "role": "system",
             "content": (
-                "You are a production research copilot. Answer based on retrieved history. "
-                "If data is missing, ask concise clarifying questions."
+                "You are a production research copilot. "
+                "If retrieved research history is provided, ground the answer in it and cite experiment ids. "
+                "If retrieved history is empty, answer normally as a general technical assistant and do not claim prior experiments."
             ),
         }
     ]
@@ -108,7 +135,8 @@ async def _invoke_huggingface_chat(
             "role": "user",
             "content": (
                 f"Question: {question}\n\n"
-                f"Retrieved research history:\n{history_text}\n\n"
+                f"Retrieved research history:\n{history_text if has_retrieved_context else 'none'}\n\n"
+                f"Mode: {'history-grounded' if has_retrieved_context else 'general-answer'}\n"
                 "Respond with concrete action-ready guidance."
             ),
         }
@@ -170,8 +198,9 @@ async def _invoke_huggingface_chat(
         "generation": {
             "provider": "huggingface",
             "model": model,
-            "strategy": "history_grounded_chat_completion",
+            "strategy": "history_grounded_chat_completion" if has_retrieved_context else "general_chat_completion",
             "latency_ms": round(latency_ms, 3),
+            "retrieval_mode": "history" if has_retrieved_context else "general",
         },
         "token_usage": {
             "prompt_tokens": prompt_tokens,

@@ -326,6 +326,7 @@ def _build_codegen_context(
         "random_seed": state.get("random_seed"),
         "required_packages": list(state.get("required_packages") or []),
         "allowed_import_roots": sorted(_build_allowed_import_roots(state)),
+        "data_report": state.get("data_report") or {},
         "clarifications": state.get("clarifications") or {},
         "research_plan": state.get("research_plan") or {},
     }
@@ -356,6 +357,7 @@ async def _invoke_codegen_llm(
         "- Keep paths strictly under project root and use relative paths.\n"
         "- config.py must include PROBLEM_TYPE and CODE_LEVEL constants.\n"
         "- main.py must be runnable entrypoint for the generated project.\n"
+        "- Preprocessing must adapt to state.data_report and detected problem_type; avoid fixed hard-coded preprocessing steps.\n"
     )
     if repair_violations:
         system_prompt += "This is a strict-state repair turn. Fix every listed violation.\n"
@@ -554,4 +556,3 @@ async def code_gen_agent_node(state: ResearchState) -> ResearchState:
         code_level=code_level,
     )
     return state
-

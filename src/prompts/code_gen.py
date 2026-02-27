@@ -14,6 +14,7 @@ ACCURACY RULES:
 - Use config-driven constants.
 - Ensure import graph is internally consistent.
 - Reflect requested complexity (`low`/`intermediate`/`advanced`) and workload type (`classification`/`regression`/etc.).
+- Build preprocessing logic from dataset report and problem type; do not assume fixed columns or fixed transforms for every dataset.
 - If requires_quantum=true, use delegate_quantum_code instead of self-generating circuit logic.
 
 RL POLICY:
