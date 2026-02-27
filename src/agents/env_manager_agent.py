@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import subprocess
 import sys
@@ -12,26 +13,11 @@ from src.config.settings import settings
 from src.core.execution_mode import is_vscode_execution_mode, local_python_command
 from src.core.logger import get_logger
 from src.core.package_installer import dry_run_install, install_package, parse_package_spec
+from src.llm.dynamic_parser import parse_json_object
+from src.llm.master_llm import invoke_master_llm
 from src.state.research_state import DenialRecord, ExperimentStatus, ResearchState
 
 logger = get_logger(__name__)
-
-FALLBACK_MAP = {
-    "torch": "scikit-learn==1.8.0",
-    "tensorflow": "scikit-learn==1.8.0",
-    "pennylane": "qiskit-aer==0.17.2",
-    "qiskit": "pennylane==0.43.0",
-    "kaggle": "requests==2.32.5",
-    "jupyter": "__skip__",
-}
-
-
-def _fallback_for(package: str) -> str:
-    for key, value in FALLBACK_MAP.items():
-        if package.startswith(key):
-            return value
-    return ""
-
 
 def _is_low_risk_package(package: str) -> bool:
     allowed = {p.strip().lower() for p in settings.LOW_RISK_PACKAGES.split(",") if p.strip()}
@@ -81,6 +67,68 @@ def _require_local_execution_result(local_mode: bool, decision: str, action: str
         raise RuntimeError("execution_result is required for local confirmation actions")
 
 
+def _candidate_specs(state: ResearchState) -> list[str]:
+    denied_items = {str(d.get("denied_item", "")) for d in state.get("denied_actions", [])}
+    specs: list[str] = []
+    for spec in state.get("required_packages") or []:
+        spec_text = str(spec).strip()
+        if not spec_text:
+            continue
+        if spec_text in state.get("installed_packages", []):
+            continue
+        if spec_text in denied_items:
+            continue
+        specs.append(spec_text)
+    return specs
+
+
+async def _invoke_env_dynamic_plan(state: ResearchState, candidates: list[str]) -> dict[str, Any]:
+    system_prompt = (
+        "SYSTEM ROLE: env_dynamic_next_action.\n"
+        "Return JSON only with keys:\n"
+        "- action: one of install_package or none\n"
+        "- package_spec: exact pinned package from candidate list if action=install_package\n"
+        "- reason: concise explanation\n"
+        "Never suggest package_spec outside the candidate list."
+    )
+    user_prompt = json.dumps(
+        {
+            "required_packages": state.get("required_packages", []),
+            "installed_packages": state.get("installed_packages", []),
+            "denied_actions": state.get("denied_actions", []),
+            "candidate_specs": candidates,
+            "framework": state.get("framework"),
+            "research_plan": state.get("research_plan", {}),
+        },
+        indent=2,
+        default=str,
+    )
+    raw = await invoke_master_llm(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        experiment_id=state["experiment_id"],
+        phase="env_manager",
+    )
+    state["llm_calls_count"] = int(state.get("llm_calls_count", 0)) + 1
+    parsed = parse_json_object(raw)
+    if not parsed:
+        logger.warning("agent.env.dynamic_parse_failed", experiment_id=state["experiment_id"])
+    return parsed
+
+
+def _validate_env_dynamic_plan(plan: dict[str, Any], candidates: list[str]) -> tuple[str, str, list[str]]:
+    violations: list[str] = []
+    action = str(plan.get("action", "")).strip().lower()
+    if action not in {"install_package", "none"}:
+        violations.append(f"unsupported action: {action}")
+    package_spec = str(plan.get("package_spec", "")).strip()
+    if action == "install_package" and package_spec not in candidates:
+        violations.append(f"package_spec must be one of candidates: {package_spec}")
+    if action == "none" and candidates:
+        violations.append("action=none is invalid when candidate packages remain")
+    return action, package_spec, violations
+
+
 async def env_manager_agent_node(state: ResearchState) -> ResearchState:
     state["phase"] = "env_manager"
     logger.info("agent.env_manager.start", experiment_id=state["experiment_id"])
@@ -127,12 +175,48 @@ async def env_manager_agent_node(state: ResearchState) -> ResearchState:
                 state["venv_ready"] = True
                 logger.info("agent.env_manager.venv.created", experiment_id=state["experiment_id"], venv_path=str(venv_path))
 
-    denied_items = {d["denied_item"] for d in state["denied_actions"]}
-    for spec in state["required_packages"]:
-        if spec in state["installed_packages"] or spec in denied_items:
-            continue
+    candidates = _candidate_specs(state)
+    fallback_static = False
+    used_dynamic = False
+    selected_spec = candidates[0] if candidates else ""
 
-        package, version = parse_package_spec(spec)
+    if candidates and settings.ENV_DYNAMIC_ENABLED:
+        plan = await _invoke_env_dynamic_plan(state, candidates)
+        if not plan:
+            if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                fallback_static = True
+                logger.warning("agent.env.dynamic_fallback_static", experiment_id=state["experiment_id"], reason="parse_failed")
+            else:
+                raise RuntimeError("Env dynamic planner failed: empty/invalid LLM JSON response")
+        else:
+            action, package_spec, violations = _validate_env_dynamic_plan(plan, candidates)
+            if violations:
+                logger.warning("agent.env.dynamic_validation_failed", experiment_id=state["experiment_id"], violations=violations)
+                if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                    fallback_static = True
+                    logger.warning("agent.env.dynamic_fallback_static", experiment_id=state["experiment_id"], reason="validation_failed")
+                else:
+                    raise RuntimeError(f"Env dynamic planner validation failed: {violations}")
+            elif action == "install_package":
+                selected_spec = package_spec
+                used_dynamic = True
+            else:
+                if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                    fallback_static = True
+                    logger.warning("agent.env.dynamic_fallback_static", experiment_id=state["experiment_id"], reason="none_action")
+                else:
+                    raise RuntimeError("Env dynamic planner returned action=none while package candidates remain")
+
+    state.setdefault("research_plan", {})["env_dynamic_plan_summary"] = {
+        "enabled": bool(settings.ENV_DYNAMIC_ENABLED),
+        "used_dynamic": used_dynamic,
+        "fallback_static": fallback_static,
+        "candidate_count": len(candidates),
+        "selected_package": selected_spec,
+    }
+
+    if selected_spec:
+        package, version = parse_package_spec(selected_spec)
         if not local_mode and settings.AUTO_CONFIRM_LOW_RISK and _is_low_risk_package(package):
             if settings.ENABLE_PACKAGE_INSTALL:
                 result = install_package(package, version, ["--quiet", "--no-cache-dir"])
@@ -147,46 +231,43 @@ async def env_manager_agent_node(state: ResearchState) -> ResearchState:
                             "timestamp": time.time(),
                         }
                     )
-                    continue
-            state["installed_packages"].append(spec)
+                else:
+                    state["installed_packages"].append(selected_spec)
+            else:
+                state["installed_packages"].append(selected_spec)
             logger.info(
                 "agent.env_manager.auto_confirmed_low_risk",
                 experiment_id=state["experiment_id"],
-                package=spec,
+                package=selected_spec,
             )
-            continue
+        else:
+            state["pending_user_confirm"] = {
+                "action_id": f"act_{uuid.uuid4().hex[:8]}",
+                "action": "install_package",
+                "phase": "env_manager",
+                "package": package,
+                "version": version,
+                "pip_flags": ["--quiet", "--no-cache-dir"],
+                "command": [local_python, "-m", "pip", "install", selected_spec, "--quiet", "--no-cache-dir"],
+                "cwd": state["project_path"],
+                "reason": f"Required for planned framework {state['framework']}",
+                "dry_run": None,
+                "next_phase": "env_manager",
+            }
 
-        fallback = _fallback_for(package)
-        state["pending_user_confirm"] = {
-            "action_id": f"act_{uuid.uuid4().hex[:8]}",
-            "action": "install_package",
-            "phase": "env_manager",
-            "package": package,
-            "version": version,
-            "pip_flags": ["--quiet", "--no-cache-dir"],
-            "command": [local_python, "-m", "pip", "install", spec, "--quiet", "--no-cache-dir"],
-            "cwd": state["project_path"],
-            "fallback_if_denied": fallback,
-            "reason": f"Required for planned framework {state['framework']}",
-            "dry_run": None,
-            "next_phase": "env_manager",
-        }
+            if not local_mode and settings.ENABLE_PACKAGE_INSTALL:
+                result = dry_run_install(package, version, ["--quiet"])
+                state["pending_user_confirm"]["dry_run"] = {"returncode": result.returncode, "stderr": result.stderr[-400:]}
 
-        # Optional dry-run validation.
-        if not local_mode and settings.ENABLE_PACKAGE_INSTALL:
-            result = dry_run_install(package, version, ["--quiet"])
-            state["pending_user_confirm"]["dry_run"] = {"returncode": result.returncode, "stderr": result.stderr[-400:]}
-
-        state["confirmations_requested"] = int(state.get("confirmations_requested", 0)) + 1
-        state["status"] = ExperimentStatus.WAITING.value
-        logger.info(
-            "agent.env_manager.pending_confirmation",
-            experiment_id=state["experiment_id"],
-            package=package,
-            version=version,
-            fallback=fallback,
-        )
-        return state
+            state["confirmations_requested"] = int(state.get("confirmations_requested", 0)) + 1
+            state["status"] = ExperimentStatus.WAITING.value
+            logger.info(
+                "agent.env_manager.pending_confirmation",
+                experiment_id=state["experiment_id"],
+                package=package,
+                version=version,
+            )
+            return state
 
     state["pending_user_confirm"] = None
     state["status"] = ExperimentStatus.RUNNING.value
@@ -202,6 +283,7 @@ async def apply_user_confirmation(
     alternative_preference: str = "",
     execution_result: dict[str, Any] | None = None,
 ) -> ResearchState:
+    _ = alternative_preference
     logger.info("agent.env_manager.confirmation.start", experiment_id=state["experiment_id"], action_id=action_id, decision=decision)
     pending = state.get("pending_user_confirm")
     if not pending or pending.get("action_id") != action_id:
@@ -381,41 +463,18 @@ async def apply_user_confirmation(
         logger.info("agent.env_manager.confirmation.accepted", experiment_id=state["experiment_id"], package=spec)
         return state
 
-    fallback = pending.get("fallback_if_denied", "")
     state["confirmations_processed"] = int(state.get("confirmations_processed", 0)) + 1
     denial: DenialRecord = {
         "action": "install_package",
         "denied_item": spec,
         "reason": reason,
-        "alternative_offered": fallback,
+        "alternative_offered": "",
         "alternative_accepted": False,
         "timestamp": time.time(),
     }
     state["denied_actions"].append(denial)
 
-    if fallback and fallback != "__skip__":
-        fb_package, fb_version = parse_package_spec(alternative_preference or fallback)
-        fb_spec = f"{fb_package}=={fb_version}" if fb_version else fb_package
-        local_python = local_python_command()
-        state["pending_user_confirm"] = {
-            "action_id": f"act_{uuid.uuid4().hex[:8]}",
-            "action": "install_package",
-            "phase": "env_manager",
-            "package": fb_package,
-            "version": fb_version,
-            "pip_flags": ["--quiet", "--no-cache-dir"],
-            "command": [local_python, "-m", "pip", "install", fb_spec, "--quiet", "--no-cache-dir"],
-            "cwd": state["project_path"],
-            "fallback_if_denied": "",
-            "reason": f"Fallback for denied package {spec}",
-            "next_phase": "env_manager",
-        }
-        state["confirmations_requested"] = int(state.get("confirmations_requested", 0)) + 1
-        state["status"] = ExperimentStatus.WAITING.value
-        logger.info("agent.env_manager.confirmation.fallback_offered", experiment_id=state["experiment_id"], fallback=fallback)
-        return state
-
     state["pending_user_confirm"] = None
     state["status"] = ExperimentStatus.RUNNING.value
-    logger.info("agent.env_manager.confirmation.denied_no_fallback", experiment_id=state["experiment_id"], denied=spec)
+    logger.info("agent.env_manager.confirmation.denied", experiment_id=state["experiment_id"], denied=spec)
     return state

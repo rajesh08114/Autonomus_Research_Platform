@@ -20,13 +20,12 @@ async def post_chat_research(request: ChatResearchRequest, request_id: str = Dep
     if (
         settings.effective_master_llm_provider == "huggingface"
         and not settings.huggingface_api_key
-        and not settings.ALLOW_RULE_BASED_FALLBACK
     ):
         raise HTTPException(
             status_code=400,
             detail=error_payload(
                 "LLM_CONFIGURATION_ERROR",
-                "HF_API_KEY (or MASTER_LLM_API_KEY) is required when ALLOW_RULE_BASED_FALLBACK=false.",
+                "HF_API_KEY (or MASTER_LLM_API_KEY) is required.",
             ),
         )
 
@@ -48,7 +47,7 @@ async def post_chat_research(request: ChatResearchRequest, request_id: str = Dep
     history_source = "collection"
     if request.test_mode and not history_states:
         history_states = await ExperimentRepository.get_recent_states(limit=lookup_limit)
-        history_source = "unified_db_fallback"
+        history_source = "unified_db_global"
 
     history_items = [state_to_summary(state) for state in history_states]
     selected = select_relevant_history(request.message, history_items, limit=context_limit)

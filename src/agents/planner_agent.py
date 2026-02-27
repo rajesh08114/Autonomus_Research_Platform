@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
+from src.config.settings import settings
 from src.core.logger import get_logger
+from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
-from src.llm.response_parser import parse_json_response
 from src.state.research_state import ExperimentStatus, ResearchState
 
 logger = get_logger(__name__)
@@ -137,17 +139,7 @@ def _package_set_for_state(state: ResearchState) -> list[str]:
     return sorted(packages)
 
 
-def _safe_parse(raw: str) -> dict[str, Any]:
-    try:
-        return parse_json_response(raw)
-    except Exception:
-        try:
-            return json.loads(str(raw or "").strip())
-        except Exception:
-            return {}
-
-
-def _clean_text_list(value: Any, limit: int = 4) -> list[str]:
+def _clean_text_list(value: Any, limit: int = 6) -> list[str]:
     if not isinstance(value, list):
         return []
     cleaned: list[str] = []
@@ -161,30 +153,116 @@ def _clean_text_list(value: Any, limit: int = 4) -> list[str]:
 
 
 def _is_valid_pin(value: str) -> bool:
-    import re
-
     return bool(re.match(_PACKAGE_PIN_PATTERN, value or ""))
 
 
-async def _llm_refine_plan(state: ResearchState, plan: dict[str, Any]) -> dict[str, Any]:
-    payload = {
-        "objective": plan.get("objective"),
-        "algorithm": plan.get("algorithm"),
-        "framework": plan.get("framework"),
-        "problem_type": plan.get("problem_type"),
-        "code_level": plan.get("code_level"),
-        "dataset_source": ((plan.get("dataset") or {}).get("source") if isinstance(plan.get("dataset"), dict) else None),
-        "target_metric": state.get("target_metric"),
-        "requires_quantum": bool(state.get("requires_quantum")),
+def _build_base_plan(
+    state: ResearchState,
+    algorithm_class: str,
+    problem_type: str,
+    code_level: str,
+    auto_retry_enabled: bool,
+) -> dict[str, Any]:
+    dataset_step = {
+        "kaggle": "download dataset from Kaggle using configured dataset id",
+        "sklearn": "load canonical sklearn dataset and persist to project data/raw",
+        "synthetic": "generate synthetic dataset based on seed and task constraints",
+        "upload": "ingest user-uploaded CSV from project data/raw",
+    }.get(state["dataset_source"], "collect or generate dataset")
+    training_step = "train hybrid quantum-classical model" if state["requires_quantum"] else "train baseline model"
+    metrics_step = f"evaluate target metric ({state['target_metric']})"
+    methodology = [
+        dataset_step,
+        "preprocess and split data",
+        training_step,
+        metrics_step,
+        "document artifacts",
+    ]
+    if state["requires_quantum"]:
+        methodology.insert(
+            3,
+            f"generate {state['quantum_framework']} circuit ({state['quantum_algorithm']}, {state['quantum_qubit_count']} qubits)",
+        )
+    if state["output_format"] == ".ipynb":
+        methodology.append("export notebook-friendly artifacts")
+
+    algorithm_name = "classical_classifier"
+    if state["requires_quantum"]:
+        algorithm_name = f"{str(state.get('quantum_algorithm') or 'VQE').lower()}_hybrid_classifier"
+    elif algorithm_class == "reinforcement":
+        algorithm_name = "reinforcement_policy_model"
+    elif algorithm_class == "unsupervised":
+        algorithm_name = "unsupervised_pattern_model"
+    elif problem_type == "regression":
+        algorithm_name = "regression_model"
+    elif problem_type == "forecasting":
+        algorithm_name = "forecasting_model"
+    elif problem_type == "generation":
+        algorithm_name = "generation_model"
+
+    return {
+        "objective": state["user_prompt"],
+        "methodology": methodology,
+        "algorithm": algorithm_name,
+        "algorithm_class": algorithm_class,
+        "problem_type": problem_type,
+        "code_level": code_level,
+        "framework": state["framework"],
+        "dataset": {
+            "source": state["dataset_source"],
+            "kaggle_dataset_id": state["kaggle_dataset_id"],
+            "expected_shape": "tabular rows x features+target",
+        },
+        "metrics": [state["target_metric"], "train_loss", "duration_sec"],
+        "hardware": {
+            "target": state["hardware_target"],
+            "default_target": "cpu",
+        },
+        "reproducibility": {
+            "seed": state["random_seed"],
+            "python_version": state["python_version"],
+            "pins": True,
+        },
+        "library_profile": "latest_stable",
+        "auto_retry_on_low_metric": auto_retry_enabled,
+        "estimated_duration_minutes": 20 if state["requires_quantum"] else 15,
     }
+
+
+async def _invoke_dynamic_planner(state: ResearchState, base_plan: dict[str, Any]) -> dict[str, Any]:
     system_prompt = (
-        "You are a strict ML/AI planning reviewer. Return only one JSON object with keys: "
-        "methodology_additions (list), risk_checks (list), package_additions (list of strict pinned "
-        "pkg==version), algorithm_override (string or empty). Keep each list <= 3."
+        "SYSTEM ROLE: planner_dynamic_plan.\n"
+        "Return JSON only with keys:\n"
+        "- objective_refinement (string)\n"
+        "- methodology (array of strings)\n"
+        "- algorithm (string)\n"
+        "- risk_checks (array of strings)\n"
+        "- package_additions (array of pinned packages pkg==version)\n"
+        "- training_strategy (string)\n"
+        "- optimizer (string)\n"
+        "- circuit_layers (integer)\n"
+        "- encoding (string)\n"
+        "- estimated_duration_minutes (integer)\n"
+        "Respect user constraints in state context."
     )
-    user_prompt = (
-        f"Base plan context:\n{json.dumps(payload, indent=2, default=str)}\n\n"
-        "Focus on latest stable APIs, reproducibility, and measurable evaluation quality."
+    user_prompt = json.dumps(
+        {
+            "clarifications": state.get("clarifications", {}),
+            "research_plan_base": base_plan,
+            "framework": state.get("framework"),
+            "dataset_source": state.get("dataset_source"),
+            "requires_quantum": state.get("requires_quantum"),
+            "quantum": {
+                "framework": state.get("quantum_framework"),
+                "algorithm": state.get("quantum_algorithm"),
+                "qubits": state.get("quantum_qubit_count"),
+                "backend": state.get("quantum_backend"),
+            },
+            "target_metric": state.get("target_metric"),
+            "required_packages": state.get("required_packages", []),
+        },
+        indent=2,
+        default=str,
     )
     raw = await invoke_master_llm(
         system_prompt=system_prompt,
@@ -193,8 +271,61 @@ async def _llm_refine_plan(state: ResearchState, plan: dict[str, Any]) -> dict[s
         phase="planner",
     )
     state["llm_calls_count"] = int(state.get("llm_calls_count", 0)) + 1
-    parsed = _safe_parse(raw)
-    return parsed if isinstance(parsed, dict) else {}
+    parsed = parse_json_object(raw)
+    if not parsed:
+        logger.warning("agent.planner.dynamic_parse_failed", experiment_id=state["experiment_id"])
+    return parsed
+
+
+def _sanitize_dynamic_plan(payload: dict[str, Any], base_plan: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    violations: list[str] = []
+    patch: dict[str, Any] = {}
+
+    objective_refinement = str(payload.get("objective_refinement", "")).strip()
+    if objective_refinement:
+        patch["objective"] = objective_refinement[:500]
+
+    methodology = _clean_text_list(payload.get("methodology"), limit=8)
+    if methodology:
+        patch["methodology"] = methodology
+    else:
+        violations.append("methodology must be a non-empty string list")
+
+    algorithm = str(payload.get("algorithm", "")).strip()
+    if algorithm:
+        patch["algorithm"] = algorithm[:120]
+    else:
+        violations.append("algorithm must be a non-empty string")
+
+    risk_checks = _clean_text_list(payload.get("risk_checks"), limit=6)
+    if risk_checks:
+        patch["risk_checks"] = risk_checks
+
+    package_additions = _clean_text_list(payload.get("package_additions"), limit=6)
+    invalid_pins = [pin for pin in package_additions if not _is_valid_pin(pin)]
+    if invalid_pins:
+        violations.append(f"invalid package pins: {invalid_pins}")
+    patch["package_additions"] = [pin for pin in package_additions if _is_valid_pin(pin)]
+
+    training_strategy = str(payload.get("training_strategy", "")).strip()
+    if training_strategy:
+        patch["training_strategy"] = training_strategy[:120]
+    optimizer = str(payload.get("optimizer", "")).strip()
+    if optimizer:
+        patch["optimizer"] = optimizer[:80]
+    encoding = str(payload.get("encoding", "")).strip()
+    if encoding:
+        patch["encoding"] = encoding[:80]
+    if "circuit_layers" in payload:
+        patch["circuit_layers"] = _normalize_int(payload.get("circuit_layers"), default=3, minimum=1, maximum=20)
+    if "estimated_duration_minutes" in payload:
+        patch["estimated_duration_minutes"] = _normalize_int(
+            payload.get("estimated_duration_minutes"),
+            default=int(base_plan.get("estimated_duration_minutes", 15)),
+            minimum=1,
+            maximum=600,
+        )
+    return patch, violations
 
 
 async def planner_agent_node(state: ResearchState) -> ResearchState:
@@ -260,95 +391,77 @@ async def planner_agent_node(state: ResearchState) -> ResearchState:
     clar["auto_retry_preference"] = "enabled" if auto_retry_enabled else "disabled"
     state["clarifications"] = clar
 
-    dataset_step = {
-        "kaggle": "download dataset from Kaggle using configured dataset id",
-        "sklearn": "load canonical sklearn dataset and persist to project data/raw",
-        "synthetic": "generate synthetic dataset based on seed and task constraints",
-        "upload": "ingest user-uploaded CSV from project data/raw",
-    }.get(state["dataset_source"], "collect or generate dataset")
-    training_step = "train hybrid quantum-classical model" if state["requires_quantum"] else "train baseline model"
-    metrics_step = f"evaluate target metric ({state['target_metric']})"
-    methodology = [
-        dataset_step,
-        "preprocess and split data",
-        training_step,
-        metrics_step,
-        "document artifacts",
-    ]
-    if state["requires_quantum"]:
-        methodology.insert(3, f"generate {state['quantum_framework']} circuit ({state['quantum_algorithm']}, {state['quantum_qubit_count']} qubits)")
-    if state["output_format"] == ".ipynb":
-        methodology.append("export notebook-friendly artifacts")
-
-    algorithm_name = "classical_classifier"
-    if state["requires_quantum"]:
-        algorithm_name = f"{str(state.get('quantum_algorithm') or 'VQE').lower()}_hybrid_classifier"
-    elif algorithm_class == "reinforcement":
-        algorithm_name = "reinforcement_policy_model"
-    elif algorithm_class == "unsupervised":
-        algorithm_name = "unsupervised_pattern_model"
-    elif problem_type == "regression":
-        algorithm_name = "regression_model"
-    elif problem_type == "forecasting":
-        algorithm_name = "forecasting_model"
-    elif problem_type == "generation":
-        algorithm_name = "generation_model"
-
-    state["research_plan"] = {
-        "objective": state["user_prompt"],
-        "methodology": methodology,
-        "algorithm": algorithm_name,
-        "algorithm_class": algorithm_class,
-        "problem_type": problem_type,
-        "code_level": code_level,
-        "framework": state["framework"],
-        "dataset": {
-            "source": state["dataset_source"],
-            "kaggle_dataset_id": state["kaggle_dataset_id"],
-            "expected_shape": "tabular rows x features+target",
-        },
-        "metrics": [state["target_metric"], "train_loss", "duration_sec"],
-        "hardware": {
-            "target": state["hardware_target"],
-            "fallback": "cpu",
-        },
-        "reproducibility": {
-            "seed": state["random_seed"],
-            "python_version": state["python_version"],
-            "pins": True,
-        },
-        "library_profile": "latest_stable",
-        "auto_retry_on_low_metric": auto_retry_enabled,
-        "estimated_duration_minutes": 20 if state["requires_quantum"] else 15,
-    }
+    plan = _build_base_plan(
+        state=state,
+        algorithm_class=algorithm_class,
+        problem_type=problem_type,
+        code_level=code_level,
+        auto_retry_enabled=auto_retry_enabled,
+    )
     state["required_packages"] = _package_set_for_state(state)
+
+    used_dynamic = False
+    fallback_static = False
+    dynamic_payload_keys: list[str] = []
     try:
-        llm_patch = await _llm_refine_plan(state, state["research_plan"])
-        if llm_patch:
-            additions = _clean_text_list(llm_patch.get("methodology_additions"), limit=3)
-            for item in additions:
-                if item not in state["research_plan"]["methodology"]:
-                    state["research_plan"]["methodology"].append(item)
+        dynamic_payload = await _invoke_dynamic_planner(state, plan)
+        if not dynamic_payload:
+            if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                fallback_static = True
+                logger.warning("agent.planner.dynamic_fallback_static", experiment_id=state["experiment_id"], reason="parse_failed")
+            else:
+                raise RuntimeError("Planner dynamic plan parse failed")
+        else:
+            patch, violations = _sanitize_dynamic_plan(dynamic_payload, plan)
+            dynamic_payload_keys = sorted(list(dynamic_payload.keys()))
+            if violations:
+                logger.warning("agent.planner.dynamic_validation_failed", experiment_id=state["experiment_id"], violations=violations)
+                if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                    fallback_static = True
+                    logger.warning(
+                        "agent.planner.dynamic_fallback_static",
+                        experiment_id=state["experiment_id"],
+                        reason="validation_failed",
+                    )
+                else:
+                    raise RuntimeError(f"Planner dynamic plan validation failed: {violations}")
+            else:
+                if "objective" in patch:
+                    plan["objective"] = patch["objective"]
+                if "methodology" in patch:
+                    plan["methodology"] = patch["methodology"]
+                if "algorithm" in patch:
+                    plan["algorithm"] = patch["algorithm"]
+                if "risk_checks" in patch:
+                    plan["risk_checks"] = patch["risk_checks"]
+                if "training_strategy" in patch:
+                    plan["training_strategy"] = patch["training_strategy"]
+                if "optimizer" in patch:
+                    plan["optimizer"] = patch["optimizer"]
+                if "encoding" in patch:
+                    plan["encoding"] = patch["encoding"]
+                if "circuit_layers" in patch:
+                    plan["circuit_layers"] = patch["circuit_layers"]
+                if "estimated_duration_minutes" in patch:
+                    plan["estimated_duration_minutes"] = patch["estimated_duration_minutes"]
+                additions = patch.get("package_additions", [])
+                if isinstance(additions, list) and additions:
+                    merged = set(state["required_packages"])
+                    merged.update(additions)
+                    state["required_packages"] = sorted(merged)
+                used_dynamic = True
+    except Exception as exc:
+        logger.exception("agent.planner.dynamic_failed", experiment_id=state["experiment_id"])
+        raise RuntimeError(f"Planner dynamic generation failed: {exc}") from exc
 
-            risk_checks = _clean_text_list(llm_patch.get("risk_checks"), limit=3)
-            if risk_checks:
-                state["research_plan"]["risk_checks"] = risk_checks
+    state["research_plan"] = plan
+    state["research_plan"]["planner_dynamic_summary"] = {
+        "used_dynamic": used_dynamic,
+        "fallback_static": fallback_static,
+        "dynamic_payload_keys": dynamic_payload_keys,
+        "package_count": len(state["required_packages"]),
+    }
 
-            algorithm_override = str(llm_patch.get("algorithm_override", "")).strip()
-            if algorithm_override:
-                state["research_plan"]["algorithm"] = algorithm_override
-
-            package_additions = _clean_text_list(llm_patch.get("package_additions"), limit=3)
-            if package_additions:
-                merged = set(state["required_packages"])
-                for pin in package_additions:
-                    if _is_valid_pin(pin):
-                        merged.add(pin)
-                state["required_packages"] = sorted(merged)
-    except Exception:
-        logger.exception("agent.planner.llm_refine_failed", experiment_id=state["experiment_id"])
-        if not settings.ALLOW_RULE_BASED_FALLBACK:
-            raise RuntimeError("Planner LLM refinement failed and rule-based fallback is disabled.")
     state["status"] = ExperimentStatus.RUNNING.value
     logger.info(
         "agent.planner.end",
@@ -359,3 +472,4 @@ async def planner_agent_node(state: ResearchState) -> ResearchState:
         package_count=len(state["required_packages"]),
     )
     return state
+

@@ -55,12 +55,12 @@ async def get_phase_policy_hint(phase: str) -> str:
     if stats.positive_rate < 0.4:
         return (
             "Policy: low positive reward rate detected. Slow down decisions, "
-            "explicitly validate assumptions, and prefer safe fallback strategies."
+            "explicitly validate assumptions, and use explicit reasoning traces."
         )
     if stats.avg_reward < 0.2:
         return (
             "Policy: high-risk phase detected from historical rewards. "
-            "Use conservative decisions, strict schema adherence, and explicit fallback handling."
+            "Use conservative decisions, strict schema adherence, and explicit validation handling."
         )
     if stats.avg_reward < 0.6:
         return (

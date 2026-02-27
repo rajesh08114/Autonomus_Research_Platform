@@ -36,7 +36,7 @@ async def error_recovery_agent_node(state: ResearchState) -> ResearchState:
             {
                 "attempt": state["retry_count"],
                 "error_category": category,
-                "fix_description": "Added fallback package to required_packages",
+                "fix_description": "Added required package to required_packages",
                 "file_changed": "requirements",
                 "find_text": "",
                 "replace_text": missing,
@@ -54,7 +54,7 @@ async def error_recovery_agent_node(state: ResearchState) -> ResearchState:
             {
                 "attempt": state["retry_count"],
                 "error_category": category,
-                "fix_description": "Forced CPU fallback",
+                "fix_description": "Forced CPU execution",
                 "file_changed": config_path,
                 "find_text": "DEVICE",
                 "replace_text": "cpu",
@@ -65,7 +65,7 @@ async def error_recovery_agent_node(state: ResearchState) -> ResearchState:
             state["status"] = ExperimentStatus.ABORTED.value
             state["timestamp_end"] = time.time()
             return state
-        logger.info("agent.error_recovery.fix_cpu_fallback", experiment_id=state["experiment_id"], file=config_path)
+        logger.info("agent.error_recovery.fix_cpu", experiment_id=state["experiment_id"], file=config_path)
 
     if category in {"SyntaxError", "IndentationError"}:
         plan = state.setdefault("research_plan", {})

@@ -11,6 +11,7 @@ from src.config.settings import settings
 from src.db.database import init_db
 from src.core.logging import configure_logging
 from src.core.logger import get_logger
+from src.llm.master_llm import assert_master_llm_ready
 
 logger = get_logger(__name__)
 
@@ -20,6 +21,12 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.LOG_LEVEL)
     logger.info("app.startup", env=settings.APP_ENV, version="2.0.0")
     await init_db()
+    try:
+        await assert_master_llm_ready()
+        logger.info("app.startup.llm_ready", model=settings.huggingface_model_id)
+    except Exception as exc:
+        logger.critical("app.startup.llm_unavailable", error=str(exc))
+        raise RuntimeError(f"Startup aborted: master LLM is not ready ({exc})") from exc
     yield
     logger.info("app.shutdown")
 

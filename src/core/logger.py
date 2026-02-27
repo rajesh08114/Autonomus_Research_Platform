@@ -5,7 +5,7 @@ from typing import Any
 
 try:
     import structlog as _structlog
-except Exception:  # pragma: no cover - fallback path when structlog is missing
+except Exception:  # pragma: no cover - alternate path when structlog is missing
     _structlog = None
 
 

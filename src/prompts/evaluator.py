@@ -10,7 +10,7 @@ SAFETY RULES:
 - Read only from project-scoped artifacts.
 
 ACCURACY RULES:
-- Prefer metrics file when present; fallback to logs only when required.
+- Require metrics file as the canonical evaluation source.
 - Always emit primary metric and full metric map.
 - Keep plot references reproducible and mapped to user-selected target metric.
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
 import json
 import random
+import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,15 +13,37 @@ from src.core.execution_mode import is_vscode_execution_mode
 from src.core.file_manager import write_text_file
 from src.core.local_actions import queue_local_file_action
 from src.core.logger import get_logger
+from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
-from src.llm.response_parser import parse_json_response
 from src.state.research_state import ResearchState
 
 logger = get_logger(__name__)
 
-_PROBLEM_TYPE_OPTIONS = {"classification", "regression", "clustering", "reinforcement", "forecasting", "generation"}
-_CODE_LEVEL_OPTIONS = {"low", "intermediate", "advanced"}
-_ALGORITHM_CLASS_OPTIONS = {"supervised", "unsupervised", "reinforcement", "quantum_ml"}
+_ALLOWED_PROBLEM_TYPES = {"classification", "regression", "clustering", "reinforcement", "forecasting", "generation"}
+_ALLOWED_CODE_LEVELS = {"low", "intermediate", "advanced"}
+_ALLOWED_ALGORITHM_CLASSES = {"supervised", "unsupervised", "reinforcement", "quantum_ml"}
+_REQUIRED_RELATIVE_FILES = (
+    "config.py",
+    "main.py",
+    "src/__init__.py",
+    "src/utils.py",
+    "src/preprocessing.py",
+    "src/model.py",
+    "src/train.py",
+    "src/evaluate.py",
+)
+_FRAMEWORK_IMPORT_ROOTS: dict[str, set[str]] = {
+    "sklearn": {"sklearn"},
+    "scikit-learn": {"sklearn"},
+    "pytorch": {"torch", "torchvision", "torchaudio"},
+    "torch": {"torch", "torchvision", "torchaudio"},
+    "tensorflow": {"tensorflow", "keras"},
+    "xgboost": {"xgboost"},
+    "lightgbm": {"lightgbm"},
+    "catboost": {"catboost"},
+    "qiskit": {"qiskit"},
+    "pennylane": {"pennylane"},
+}
 
 
 def _should_inject_failure(point: str) -> bool:
@@ -30,82 +55,324 @@ def _should_inject_failure(point: str) -> bool:
     return random.random() < float(max(0.0, min(1.0, settings.FAILURE_INJECTION_RATE)))
 
 
-def _normalize_choice(value: Any, options: set[str], default: str) -> str:
-    text = str(value or "").strip().lower()
-    if text in options:
-        return text
+def _pick_state_value(*values: Any, default: str) -> str:
+    for value in values:
+        text = str(value or "").strip().lower()
+        if text:
+            return text
     return default
 
 
 def _resolve_problem_type(state: ResearchState) -> str:
-    from_plan = str((state.get("research_plan") or {}).get("problem_type", "")).strip().lower()
-    from_clar = str((state.get("clarifications") or {}).get("problem_type", "")).strip().lower()
-    target_metric = str(state.get("target_metric", "")).strip().lower()
-    algorithm_class = str((state.get("clarifications") or {}).get("algorithm_class", "supervised")).strip().lower()
-    selected = from_plan or from_clar
-    if selected in _PROBLEM_TYPE_OPTIONS:
-        return selected
-    if target_metric in {"rmse", "mae", "mse", "r2"}:
-        return "regression"
-    if algorithm_class == "unsupervised":
-        return "clustering"
-    if algorithm_class == "reinforcement":
-        return "reinforcement"
-    return "classification"
+    selected = _pick_state_value(
+        (state.get("research_plan") or {}).get("problem_type"),
+        (state.get("clarifications") or {}).get("problem_type"),
+        default="classification",
+    )
+    return selected if selected in _ALLOWED_PROBLEM_TYPES else "classification"
 
 
 def _resolve_code_level(state: ResearchState) -> str:
-    from_plan = str((state.get("research_plan") or {}).get("code_level", "")).strip().lower()
-    from_clar = str((state.get("clarifications") or {}).get("code_level", "")).strip().lower()
-    return _normalize_choice(from_plan or from_clar, _CODE_LEVEL_OPTIONS, "intermediate")
+    selected = _pick_state_value(
+        (state.get("research_plan") or {}).get("code_level"),
+        (state.get("clarifications") or {}).get("code_level"),
+        default="intermediate",
+    )
+    return selected if selected in _ALLOWED_CODE_LEVELS else "intermediate"
 
 
 def _resolve_algorithm_class(state: ResearchState) -> str:
-    from_plan = str((state.get("research_plan") or {}).get("algorithm_class", "")).strip().lower()
-    from_clar = str((state.get("clarifications") or {}).get("algorithm_class", "")).strip().lower()
-    return _normalize_choice(from_plan or from_clar, _ALGORITHM_CLASS_OPTIONS, "supervised")
+    selected = _pick_state_value(
+        (state.get("research_plan") or {}).get("algorithm_class"),
+        (state.get("clarifications") or {}).get("algorithm_class"),
+        default="supervised",
+    )
+    return selected if selected in _ALLOWED_ALGORITHM_CLASSES else "supervised"
 
 
-def _safe_parse(raw: str) -> dict[str, Any]:
+def _extract_file_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("files", "source_files", "file_operations"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _to_project_path(project: Path, raw_path: str) -> Path:
+    candidate = Path(str(raw_path or "").strip())
+    resolved = (candidate if candidate.is_absolute() else project / candidate).resolve()
+    project_resolved = project.resolve()
     try:
-        return parse_json_response(raw)
-    except Exception:
-        try:
-            return json.loads(str(raw or "").strip())
-        except Exception:
-            return {}
+        resolved.relative_to(project_resolved)
+    except ValueError as exc:
+        raise RuntimeError(f"Generated file path is outside project root: {raw_path}") from exc
+    return resolved
 
 
-def _clean_line(value: Any) -> str:
-    text = str(value or "").strip()
-    return " ".join(text.split())[:180]
+def _normalize_manifest(project: Path, items: list[dict[str, Any]]) -> dict[str, str]:
+    manifest: dict[str, str] = {}
+    for item in items:
+        raw_path = str(item.get("path") or item.get("file_path") or "").strip()
+        if not raw_path:
+            continue
+        content = item.get("content")
+        if content is None:
+            content = item.get("code", "")
+        abs_path = _to_project_path(project, raw_path)
+        manifest[str(abs_path)] = str(content)
+    return manifest
 
 
-def _py_string(value: str) -> str:
-    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+def _required_absolute_paths(project: Path) -> list[str]:
+    return [str((project / rel).resolve()) for rel in _REQUIRED_RELATIVE_FILES]
 
 
-async def _llm_codegen_guidance(
+def _ensure_config_contract(
+    manifest: dict[str, str],
+    project: Path,
+    problem_type: str,
+    code_level: str,
+    algorithm_class: str,
+    target_metric: str,
+    hardware_target: str,
+) -> None:
+    config_path = str((project / "config.py").resolve())
+    current = str(manifest.get(config_path, ""))
+    patch_lines: list[str] = []
+    if "PROBLEM_TYPE" not in current:
+        patch_lines.append(f'PROBLEM_TYPE = "{problem_type}"')
+    if "CODE_LEVEL" not in current:
+        patch_lines.append(f'CODE_LEVEL = "{code_level}"')
+    if "ALGORITHM_CLASS" not in current:
+        patch_lines.append(f'ALGORITHM_CLASS = "{algorithm_class}"')
+    if "TARGET_METRIC" not in current:
+        patch_lines.append(f'TARGET_METRIC = "{target_metric}"')
+    if "DEVICE" not in current:
+        patch_lines.append(f'DEVICE = "cpu" if "{hardware_target}" != "cuda" else "cuda"')
+    if patch_lines:
+        suffix = "\n".join(patch_lines)
+        manifest[config_path] = f"{current.rstrip()}\n\n{suffix}\n".lstrip()
+
+
+def _validate_required_files(manifest: dict[str, str], project: Path) -> list[str]:
+    missing: list[str] = []
+    for path in _required_absolute_paths(project):
+        if path not in manifest:
+            missing.append(path)
+            continue
+        rel = str(Path(path).resolve().relative_to(project.resolve())).replace("\\", "/")
+        if rel == "src/__init__.py":
+            continue
+        if not str(manifest.get(path, "")).strip():
+            missing.append(path)
+    return missing
+
+
+def _normalize_import_root(spec: str) -> str:
+    raw = str(spec or "").strip().lower()
+    if not raw:
+        return ""
+    raw = raw.split("==", 1)[0]
+    raw = raw.split("[", 1)[0]
+    raw = raw.replace("-", "_")
+    return raw.split(".", 1)[0]
+
+
+def _build_allowed_import_roots(state: ResearchState) -> set[str]:
+    allowed: set[str] = set(getattr(sys, "stdlib_module_names", set()))
+    allowed.update({"config", "src"})
+    for spec in state.get("required_packages") or []:
+        root = _normalize_import_root(str(spec))
+        if root:
+            allowed.add(root)
+    framework = str(state.get("framework") or "").strip().lower()
+    allowed.update(_FRAMEWORK_IMPORT_ROOTS.get(framework, set()))
+    if bool(state.get("requires_quantum")):
+        q_framework = str(state.get("quantum_framework") or "").strip().lower()
+        allowed.update(_FRAMEWORK_IMPORT_ROOTS.get(q_framework, set()))
+    return allowed
+
+
+def _collect_import_roots(content: str, file_path: str) -> tuple[set[str], list[str]]:
+    roots: set[str] = set()
+    errors: list[str] = []
+    try:
+        tree = ast.parse(content, filename=file_path)
+    except SyntaxError as exc:
+        errors.append(f"{file_path}: syntax error during strict validation ({exc.msg})")
+        return roots, errors
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = str(alias.name or "").strip()
+                root = name.split(".", 1)[0]
+                if root:
+                    roots.add(root)
+        elif isinstance(node, ast.ImportFrom):
+            if int(getattr(node, "level", 0) or 0) > 0:
+                continue
+            module = str(getattr(node, "module", "") or "").strip()
+            root = module.split(".", 1)[0] if module else ""
+            if root:
+                roots.add(root)
+    return roots, errors
+
+
+def _payload_contract_from_response(payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        "problem_type": str(payload.get("problem_type") or "").strip().lower(),
+        "code_level": str(payload.get("code_level") or "").strip().lower(),
+        "algorithm_class": str(payload.get("algorithm_class") or "").strip().lower(),
+    }
+
+
+def _extract_py_constant(content: str, name: str) -> str:
+    pattern = re.compile(rf"^\s*{re.escape(name)}\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
+    match = pattern.search(content)
+    if not match:
+        return ""
+    return str(match.group(1)).strip().lower()
+
+
+def _collect_strict_violations(
+    *,
+    state: ResearchState,
+    payload: dict[str, Any],
+    manifest: dict[str, str],
+    project: Path,
+    expected_problem_type: str,
+    expected_code_level: str,
+    expected_algorithm_class: str,
+) -> list[str]:
+    violations: list[str] = []
+    missing_after_parse = _validate_required_files(manifest, project)
+    if missing_after_parse:
+        missing_rel = [str(Path(path).resolve().relative_to(project.resolve())).replace("\\", "/") for path in missing_after_parse]
+        violations.append(f"Missing required files: {missing_rel}")
+
+    if not settings.STRICT_STATE_ONLY:
+        return violations
+
+    contract = _payload_contract_from_response(payload)
+    if contract["problem_type"] != expected_problem_type:
+        violations.append(
+            f"Payload problem_type mismatch: expected '{expected_problem_type}', got '{contract['problem_type'] or '<missing>'}'"
+        )
+    if contract["code_level"] != expected_code_level:
+        violations.append(f"Payload code_level mismatch: expected '{expected_code_level}', got '{contract['code_level'] or '<missing>'}'")
+    if settings.STRICT_STATE_ONLY_ENFORCE_ALGO_CLASS and contract["algorithm_class"] != expected_algorithm_class:
+        violations.append(
+            "Payload algorithm_class mismatch: "
+            f"expected '{expected_algorithm_class}', got '{contract['algorithm_class'] or '<missing>'}'"
+        )
+
+    config_path = str((project / "config.py").resolve())
+    config_content = str(manifest.get(config_path, ""))
+    config_problem = _extract_py_constant(config_content, "PROBLEM_TYPE")
+    config_code_level = _extract_py_constant(config_content, "CODE_LEVEL")
+    config_algo = _extract_py_constant(config_content, "ALGORITHM_CLASS")
+    if config_problem and config_problem != expected_problem_type:
+        violations.append(
+            f"config.py PROBLEM_TYPE mismatch: expected '{expected_problem_type}', got '{config_problem}'"
+        )
+    if config_code_level and config_code_level != expected_code_level:
+        violations.append(f"config.py CODE_LEVEL mismatch: expected '{expected_code_level}', got '{config_code_level}'")
+    if settings.STRICT_STATE_ONLY_ENFORCE_ALGO_CLASS and config_algo and config_algo != expected_algorithm_class:
+        violations.append(
+            f"config.py ALGORITHM_CLASS mismatch: expected '{expected_algorithm_class}', got '{config_algo}'"
+        )
+
+    if settings.STRICT_STATE_ONLY_ENFORCE_IMPORTS:
+        allowed_roots = _build_allowed_import_roots(state)
+        for path, content in manifest.items():
+            if Path(path).suffix != ".py":
+                continue
+            roots, parse_errors = _collect_import_roots(content, path)
+            violations.extend(parse_errors)
+            disallowed = sorted(root for root in roots if root not in allowed_roots)
+            if disallowed:
+                rel = str(Path(path).resolve().relative_to(project.resolve())).replace("\\", "/")
+                violations.append(f"{rel} uses disallowed import roots: {disallowed}")
+    return violations
+
+
+def _build_codegen_context(
     state: ResearchState,
     problem_type: str,
     code_level: str,
     algorithm_class: str,
-) -> dict[str, str]:
-    payload = {
-        "framework": state.get("framework"),
-        "requires_quantum": bool(state.get("requires_quantum")),
+) -> dict[str, Any]:
+    return {
+        "experiment_id": state.get("experiment_id"),
+        "user_prompt": state.get("user_prompt"),
+        "research_type": state.get("research_type"),
         "problem_type": problem_type,
         "code_level": code_level,
         "algorithm_class": algorithm_class,
+        "framework": state.get("framework"),
+        "python_version": state.get("python_version"),
         "target_metric": state.get("target_metric"),
+        "requires_quantum": bool(state.get("requires_quantum")),
+        "quantum_framework": state.get("quantum_framework"),
+        "quantum_algorithm": state.get("quantum_algorithm"),
+        "quantum_qubit_count": state.get("quantum_qubit_count"),
+        "quantum_backend": state.get("quantum_backend"),
+        "dataset_source": state.get("dataset_source"),
+        "dataset_path": state.get("dataset_path"),
+        "kaggle_dataset_id": state.get("kaggle_dataset_id"),
         "hardware_target": state.get("hardware_target"),
+        "max_epochs": state.get("max_epochs"),
+        "batch_size": state.get("batch_size"),
+        "random_seed": state.get("random_seed"),
+        "required_packages": list(state.get("required_packages") or []),
+        "allowed_import_roots": sorted(_build_allowed_import_roots(state)),
+        "clarifications": state.get("clarifications") or {},
+        "research_plan": state.get("research_plan") or {},
     }
+
+
+async def _invoke_codegen_llm(
+    *,
+    state: ResearchState,
+    context: dict[str, Any],
+    required_relative_files: list[str],
+    repair_violations: list[str] | None = None,
+    existing_files: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    repair_violations = list(repair_violations or [])
     system_prompt = (
-        "You are a senior code generation reviewer. Return one JSON object only with keys: "
-        "implementation_focus, evaluation_focus, failure_prevention. "
-        "Each value must be one short actionable sentence."
+        "SYSTEM ROLE: codegen_file_manifest.\n"
+        "Generate project source files dynamically from user state.\n"
+        "Return one JSON object only with keys:\n"
+        "- problem_type (string)\n"
+        "- code_level (string)\n"
+        "- algorithm_class (string)\n"
+        "- files (array of {\"path\": \"relative/path.py\", \"content\": \"...\"})\n"
+        "Rules:\n"
+        "- problem_type, code_level, algorithm_class MUST exactly match provided state contract.\n"
+        "- Use only allowed import roots from state context.\n"
+        "- No placeholders, no TODO, no pseudo-code.\n"
+        "- Do not use unsafe patterns (eval, exec, os.system, shell=True).\n"
+        "- Keep paths strictly under project root and use relative paths.\n"
+        "- config.py must include PROBLEM_TYPE and CODE_LEVEL constants.\n"
+        "- main.py must be runnable entrypoint for the generated project.\n"
     )
-    user_prompt = f"Project context:\n{json.dumps(payload, indent=2, default=str)}"
+    if repair_violations:
+        system_prompt += "This is a strict-state repair turn. Fix every listed violation.\n"
+
+    prompt_parts = [
+        f"Required file set:\n{json.dumps(required_relative_files, indent=2)}",
+        f"State context:\n{json.dumps(context, indent=2, default=str)}",
+    ]
+    if existing_files:
+        prompt_parts.append(
+            f"Existing generated files (absolute_path -> content):\n{json.dumps(existing_files, indent=2, default=str)}"
+        )
+    if repair_violations:
+        prompt_parts.append(f"Strict violations to fix exactly:\n{json.dumps(repair_violations, indent=2)}")
+    prompt_parts.append("Return JSON only.")
+    user_prompt = "\n\n".join(prompt_parts)
+
     raw = await invoke_master_llm(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -113,536 +380,95 @@ async def _llm_codegen_guidance(
         phase="code_generator",
     )
     state["llm_calls_count"] = int(state.get("llm_calls_count", 0)) + 1
-    parsed = _safe_parse(raw)
-    if not isinstance(parsed, dict):
-        return {}
-    guidance = {
-        "implementation_focus": _clean_line(parsed.get("implementation_focus")),
-        "evaluation_focus": _clean_line(parsed.get("evaluation_focus")),
-        "failure_prevention": _clean_line(parsed.get("failure_prevention")),
-    }
-    return {k: v for k, v in guidance.items() if v}
+    parsed = parse_json_object(raw)
+    if not parsed:
+        logger.warning("agent.codegen.dynamic_parse_failed", experiment_id=state["experiment_id"])
+    return parsed
 
 
-def _config_template(
+async def _generate_dynamic_files(
     state: ResearchState,
+    project: Path,
     problem_type: str,
     code_level: str,
     algorithm_class: str,
-    llm_guidance: dict[str, str] | None = None,
-) -> str:
-    guidance = llm_guidance or {}
-    implementation_focus = _py_string(str(guidance.get("implementation_focus", "")))
-    evaluation_focus = _py_string(str(guidance.get("evaluation_focus", "")))
-    failure_prevention = _py_string(str(guidance.get("failure_prevention", "")))
-    return f"""from __future__ import annotations
-import os
-import random
+) -> dict[str, str]:
+    context = _build_codegen_context(state, problem_type, code_level, algorithm_class)
+    required_relative_files = list(_REQUIRED_RELATIVE_FILES)
+    repair_attempts = max(0, int(settings.STRICT_STATE_ONLY_REPAIR_ATTEMPTS))
 
-EXPERIMENT_ID = "{state["experiment_id"]}"
-PROJECT_ROOT = r"{state["project_path"]}"
-
-DATA_RAW_PATH = os.path.join(PROJECT_ROOT, "data", "raw")
-DATA_PROCESSED_PATH = os.path.join(PROJECT_ROOT, "data", "processed")
-MODEL_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "outputs", "model_checkpoint")
-METRICS_PATH = os.path.join(PROJECT_ROOT, "outputs", "metrics.json")
-PLOTS_PATH = os.path.join(PROJECT_ROOT, "outputs", "plots")
-LOG_PATH = os.path.join(PROJECT_ROOT, "logs", "run.log")
-
-RANDOM_SEED = {state["random_seed"]}
-MAX_EPOCHS = {int(state.get("max_epochs") or 50)}
-BATCH_SIZE = {int(state.get("batch_size") or 32)}
-LEARNING_RATE = 0.01
-DEVICE = "cpu" if "{state["hardware_target"]}" != "cuda" else "cuda"
-FRAMEWORK = "{state["framework"]}"
-TARGET_METRIC = "{state["target_metric"]}"
-PROBLEM_TYPE = "{problem_type}"
-CODE_LEVEL = "{code_level}"
-ALGORITHM_CLASS = "{algorithm_class}"
-REQUIRES_QUANTUM = {str(bool(state.get("requires_quantum")))}
-QUANTUM_FRAMEWORK = "{state.get("quantum_framework") or ""}"
-QUANTUM_BACKEND = "{state.get("quantum_backend") or ""}"
-QUBIT_COUNT = {int(state.get("quantum_qubit_count") or 0)}
-LLM_IMPLEMENTATION_FOCUS = "{implementation_focus}"
-LLM_EVALUATION_FOCUS = "{evaluation_focus}"
-LLM_FAILURE_PREVENTION = "{failure_prevention}"
-
-def set_global_seed() -> None:
-    random.seed(RANDOM_SEED)
-"""
-
-
-def _utils_template() -> str:
-    return """from __future__ import annotations
-import json
-import logging
-from pathlib import Path
-
-def get_logger(name: str) -> logging.Logger:
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-    return logger
-
-def write_json(path: str, payload: dict) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-"""
-
-
-def _preprocessing_template(problem_type: str) -> str:
-    label_note = "numeric target" if problem_type == "regression" else "binary target"
-    return f"""from __future__ import annotations
-import csv
-import random
-import statistics
-from typing import Any
-
-FEATURES = ["feature_1", "feature_2", "feature_3"]
-LABEL_NOTE = "{label_note}"
-
-def _to_float(raw: object) -> float | None:
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except Exception:
-        return None
-
-def load_dataset(path: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            rows.append(dict(row))
-    return rows
-
-def preprocess_rows(rows: list[dict[str, Any]]) -> tuple[list[tuple[float, float, float]], list[float], dict[str, Any]]:
-    if not rows:
-        raise ValueError("No rows available for preprocessing")
-
-    columns: dict[str, list[float]] = {{name: [] for name in FEATURES}}
-    for row in rows:
-        for name in FEATURES:
-            value = _to_float(row.get(name))
-            if value is not None:
-                columns[name].append(value)
-    medians = {{name: (statistics.median(values) if values else 0.0) for name, values in columns.items()}}
-    mins = {{name: min(values) if values else 0.0 for name, values in columns.items()}}
-    maxs = {{name: max(values) if values else 1.0 for name, values in columns.items()}}
-
-    features: list[tuple[float, float, float]] = []
-    labels: list[float] = []
-    for row in rows:
-        vector: list[float] = []
-        for name in FEATURES:
-            value = _to_float(row.get(name))
-            if value is None:
-                value = float(medians[name])
-            denom = float(maxs[name] - mins[name])
-            scaled = 0.0 if denom == 0 else (value - mins[name]) / denom
-            vector.append(float(round(scaled, 8)))
-        raw_target = _to_float(row.get("target"))
-        if raw_target is None:
-            raw_target = 0.0
-        features.append((vector[0], vector[1], vector[2]))
-        labels.append(float(raw_target))
-
-    report = {{
-        "strategy": {{
-            "missing_values": "median_imputation",
-            "scaling": "min_max",
-            "split": "seeded_shuffle",
-        }},
-        "rows": len(rows),
-        "label_note": LABEL_NOTE,
-        "medians": medians,
-        "mins": mins,
-        "maxs": maxs,
-    }}
-    return features, labels, report
-
-def train_test_split(features: list[tuple[float, float, float]], labels: list[float], seed: int = 42) -> tuple[list, list, list, list]:
-    indices = list(range(len(features)))
-    random.Random(seed).shuffle(indices)
-    split_idx = int(len(indices) * 0.8)
-    train_idx = indices[:split_idx]
-    test_idx = indices[split_idx:]
-    train_x = [features[i] for i in train_idx]
-    train_y = [labels[i] for i in train_idx]
-    test_x = [features[i] for i in test_idx]
-    test_y = [labels[i] for i in test_idx]
-    return train_x, train_y, test_x, test_y
-"""
-
-
-def _model_template(problem_type: str, code_level: str) -> str:
-    advanced_note = "True" if code_level == "advanced" else "False"
-    return f"""from __future__ import annotations
-import math
-from typing import Iterable
-
-try:
-    from src.quantum_circuit import QuantumLayer
-except Exception:
-    class QuantumLayer:
-        def forward(self, x: Iterable[float]) -> list[float]:
-            values = list(x)
-            total = float(sum(values))
-            return [total / max(len(values), 1)]
-
-PROBLEM_TYPE = "{problem_type}"
-ADVANCED_MODE = {advanced_note}
-
-def _mean(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    return float(sum(values) / len(values))
-
-def _mean_vector(vectors: list[list[float]]) -> list[float]:
-    if not vectors:
-        return [0.0, 0.0, 0.0, 0.0]
-    size = len(vectors[0])
-    out = []
-    for idx in range(size):
-        out.append(sum(row[idx] for row in vectors) / len(vectors))
-    return out
-
-class HybridResearchModel:
-    def __init__(self) -> None:
-        self.quantum = QuantumLayer()
-        self.problem_type = PROBLEM_TYPE
-        self.majority = 0
-        self.weights = [0.4, 0.35, 0.25]
-        self.bias = 0.0
-        self.centroids = {{0: [0.0, 0.0, 0.0, 0.0], 1: [0.0, 0.0, 0.0, 0.0]}}
-        self.cluster_centers = [[0.2, 0.2, 0.2], [0.8, 0.8, 0.8]]
-
-    def _augment(self, x: Iterable[float]) -> list[float]:
-        values = [float(v) for v in x]
-        q = self.quantum.forward(values)
-        quantum_value = float(q[0]) if isinstance(q, list) and q else 0.0
-        return [values[0], values[1], values[2], quantum_value]
-
-    @staticmethod
-    def _distance(a: list[float], b: list[float]) -> float:
-        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
-
-    def fit(self, X: list[tuple[float, float, float]], y: list[float]) -> None:
-        if self.problem_type == "regression":
-            if not X:
-                return
-            avg_x = [sum(row[idx] for row in X) / len(X) for idx in range(3)]
-            avg_y = _mean(y)
-            self.weights = [avg_y * (0.3 + 0.1 * avg_x[idx]) for idx in range(3)]
-            self.bias = avg_y * 0.1
-            if ADVANCED_MODE:
-                # small calibration for advanced mode to reduce bias drift
-                self.bias = self.bias * 0.9
-            return
-
-        if self.problem_type == "clustering":
-            if not X:
-                return
-            midpoint = max(1, len(X) // 2)
-            left = [list(x) for x in X[:midpoint]]
-            right = [list(x) for x in X[midpoint:]]
-            if left:
-                self.cluster_centers[0] = [sum(v[i] for v in left) / len(left) for i in range(3)]
-            if right:
-                self.cluster_centers[1] = [sum(v[i] for v in right) / len(right) for i in range(3)]
-            return
-
-        labels = [1 if float(item) > 0.5 else 0 for item in y]
-        zeros = sum(1 for value in labels if value == 0)
-        ones = len(labels) - zeros
-        self.majority = 1 if ones >= zeros else 0
-        grouped = {{0: [], 1: []}}
-        for row, label in zip(X, labels):
-            grouped[int(label)].append(self._augment(row))
-        for label in (0, 1):
-            self.centroids[label] = _mean_vector(grouped[label])
-
-    def predict(self, X: list[tuple[float, float, float]]) -> list[float]:
-        if self.problem_type == "regression":
-            preds: list[float] = []
-            for row in X:
-                pred = sum(float(row[idx]) * self.weights[idx] for idx in range(3)) + self.bias
-                preds.append(float(pred))
-            return preds
-
-        if self.problem_type == "clustering":
-            preds = []
-            for row in X:
-                d0 = self._distance(list(row), self.cluster_centers[0])
-                d1 = self._distance(list(row), self.cluster_centers[1])
-                preds.append(float(0 if d0 <= d1 else 1))
-            return preds
-
-        preds = []
-        for row in X:
-            vector = self._augment(row)
-            d0 = self._distance(vector, self.centroids[0])
-            d1 = self._distance(vector, self.centroids[1])
-            if d0 == d1:
-                preds.append(float(self.majority))
-            else:
-                preds.append(float(0 if d0 < d1 else 1))
-        return preds
-"""
-
-
-def _train_template(problem_type: str, code_level: str) -> str:
-    extra_loop = "int(config.MAX_EPOCHS * 1.2)" if code_level == "advanced" else "config.MAX_EPOCHS"
-    return f"""from __future__ import annotations
-import math
-import os
-import time
-
-from src.preprocessing import load_dataset, preprocess_rows, train_test_split
-from src.model import HybridResearchModel
-from src.utils import write_json, get_logger
-import config
-
-PROBLEM_TYPE = "{problem_type}"
-
-def _classification_metrics(preds: list[float], labels: list[float]) -> dict:
-    y_true = [1 if float(v) > 0.5 else 0 for v in labels]
-    y_pred = [1 if float(v) > 0.5 else 0 for v in preds]
-    correct = sum(1 for p, y in zip(y_pred, y_true) if p == y)
-    accuracy = correct / max(len(y_true), 1)
-    fp = sum(1 for p, y in zip(y_pred, y_true) if p == 1 and y == 0)
-    fn = sum(1 for p, y in zip(y_pred, y_true) if p == 0 and y == 1)
-    precision = correct / max(correct + fp, 1)
-    recall = correct / max(correct + fn, 1)
-    f1 = 0.0 if precision + recall == 0 else (2 * precision * recall / (precision + recall))
-    return {{
-        "accuracy": float(accuracy),
-        "f1_macro": float(f1),
-        "roc_auc": float(accuracy),
-        "rmse": float(math.sqrt(max(0.0, 1.0 - accuracy))),
-    }}
-
-def _regression_metrics(preds: list[float], labels: list[float]) -> dict:
-    errors = [float(p) - float(y) for p, y in zip(preds, labels)]
-    mse = sum(err * err for err in errors) / max(len(errors), 1)
-    mae = sum(abs(err) for err in errors) / max(len(errors), 1)
-    rmse = math.sqrt(max(0.0, mse))
-    mean_y = sum(float(y) for y in labels) / max(len(labels), 1)
-    ss_tot = sum((float(y) - mean_y) ** 2 for y in labels)
-    ss_res = sum((float(y) - float(p)) ** 2 for p, y in zip(preds, labels))
-    r2 = 0.0 if ss_tot == 0 else (1.0 - (ss_res / ss_tot))
-    return {{
-        "rmse": float(rmse),
-        "mae": float(mae),
-        "mse": float(mse),
-        "r2": float(r2),
-        "accuracy": float(max(0.0, 1.0 - min(1.0, rmse))),
-    }}
-
-def run_training() -> dict:
-    start = time.time()
-    logger = get_logger("train")
-    rows = load_dataset(os.path.join(config.DATA_RAW_PATH, "dataset.csv"))
-    features, labels, preprocess_report = preprocess_rows(rows)
-    train_x, train_y, test_x, test_y = train_test_split(features, labels, seed=config.RANDOM_SEED)
-
-    model = HybridResearchModel()
-    model.fit(train_x, train_y)
-    preds = model.predict(test_x)
-    metrics = _regression_metrics(preds, test_y) if PROBLEM_TYPE == "regression" else _classification_metrics(preds, test_y)
-
-    history = []
-    epochs = max(1, {extra_loop})
-    for epoch in range(1, epochs + 1):
-        progress = epoch / max(epochs, 1)
-        primary = float(metrics.get(config.TARGET_METRIC, metrics.get("accuracy", 0.0)))
-        if PROBLEM_TYPE == "regression":
-            loss = max(0.0001, float(metrics.get("mse", 1.0)) * (1.05 - progress))
-            trend_metric = max(0.0, float(metrics.get("r2", 0.0)) * (0.5 + 0.5 * progress))
-        else:
-            loss = max(0.01, (1.0 - primary) * (1.1 - progress))
-            trend_metric = min(1.0, primary * (0.6 + 0.4 * progress))
-        history.append({{"epoch": epoch, "loss": round(float(loss), 6), "metric": round(float(trend_metric), 6)}})
-
-    result = {{
-        "problem_type": PROBLEM_TYPE,
-        "algorithm_class": config.ALGORITHM_CLASS,
-        "train_loss": float(history[-1]["loss"] if history else 1.0),
-        "duration_sec": round(time.time() - start, 6),
-        "evaluation": metrics,
-        "preprocessing": preprocess_report,
-        "training_history": history,
-        "plot_inputs": {{
-            "feature_1": [x[0] for x in test_x[:80]],
-            "feature_2": [x[1] for x in test_x[:80]],
-            "labels": [float(y) for y in test_y[:80]],
-        }},
-    }}
-    os.makedirs(config.MODEL_CHECKPOINT_PATH, exist_ok=True)
-    write_json(
-        os.path.join(config.MODEL_CHECKPOINT_PATH, "model.json"),
-        {{
-            "framework": config.FRAMEWORK,
-            "problem_type": PROBLEM_TYPE,
-            "quantum_framework": config.QUANTUM_FRAMEWORK,
-            "code_level": config.CODE_LEVEL,
-        }},
+    payload = await _invoke_codegen_llm(
+        state=state,
+        context=context,
+        required_relative_files=required_relative_files,
     )
-    write_json(os.path.join(config.DATA_PROCESSED_PATH, "preprocessing_report.json"), preprocess_report)
-    write_json(os.path.join(config.DATA_PROCESSED_PATH, "training_history.json"), {{"history": history}})
-    logger.info("Training completed")
-    return result
-"""
+    manifest = _normalize_manifest(project, _extract_file_items(payload))
+    _ensure_config_contract(
+        manifest=manifest,
+        project=project,
+        problem_type=problem_type,
+        code_level=code_level,
+        algorithm_class=algorithm_class,
+        target_metric=str(state.get("target_metric") or "accuracy"),
+        hardware_target=str(state.get("hardware_target") or "cpu"),
+    )
 
+    violations = _collect_strict_violations(
+        state=state,
+        payload=payload,
+        manifest=manifest,
+        project=project,
+        expected_problem_type=problem_type,
+        expected_code_level=code_level,
+        expected_algorithm_class=algorithm_class,
+    )
+    state.setdefault("research_plan", {})["codegen_strict_violations"] = list(violations)
+    if violations:
+        logger.warning("agent.codegen.dynamic_validation_failed", experiment_id=state["experiment_id"], violations=violations)
 
-def _evaluate_template(problem_type: str) -> str:
-    return f"""from __future__ import annotations
-import os
-from pathlib import Path
+    attempts_used = 0
+    while violations and attempts_used < repair_attempts:
+        attempts_used += 1
+        payload = await _invoke_codegen_llm(
+            state=state,
+            context=context,
+            required_relative_files=required_relative_files,
+            repair_violations=violations,
+            existing_files=manifest,
+        )
+        repaired_manifest = _normalize_manifest(project, _extract_file_items(payload))
+        if repaired_manifest:
+            manifest.update(repaired_manifest)
+        _ensure_config_contract(
+            manifest=manifest,
+            project=project,
+            problem_type=problem_type,
+            code_level=code_level,
+            algorithm_class=algorithm_class,
+            target_metric=str(state.get("target_metric") or "accuracy"),
+            hardware_target=str(state.get("hardware_target") or "cpu"),
+        )
+        violations = _collect_strict_violations(
+            state=state,
+            payload=payload,
+            manifest=manifest,
+            project=project,
+            expected_problem_type=problem_type,
+            expected_code_level=code_level,
+            expected_algorithm_class=algorithm_class,
+        )
+        state.setdefault("research_plan", {})["codegen_strict_violations"] = list(violations)
+        if violations:
+            logger.warning(
+                "agent.codegen.dynamic_validation_failed",
+                experiment_id=state["experiment_id"],
+                attempt=attempts_used,
+                violations=violations,
+            )
 
-from src.utils import write_json
-import config
-
-PROBLEM_TYPE = "{problem_type}"
-
-def _write_explanation(payload: dict) -> str:
-    target = Path(config.PROJECT_ROOT) / "docs" / "model_explanation.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    eval_metrics = payload.get("evaluation", {{}})
-    lines = [
-        "# Model Explanation",
-        "",
-        f"- Problem type: {{payload.get('problem_type')}}",
-        f"- Algorithm class: {{payload.get('algorithm_class')}}",
-        f"- Target metric: {{payload.get('target_metric')}}",
-        f"- Primary value: {{payload.get('primary_metric_value')}}",
-        "",
-        "## Metrics",
-    ]
-    for key, value in eval_metrics.items():
-        lines.append(f"- {{key}}: {{value}}")
-    target.write_text("\\n".join(lines), encoding="utf-8")
-    return str(target)
-
-def _generate_plots(metrics: dict) -> list[str]:
-    os.makedirs(config.PLOTS_PATH, exist_ok=True)
-    outputs: list[str] = []
-    history = metrics.get("training_history", [])
-    plot_inputs = metrics.get("plot_inputs", {{}})
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        epochs = [item.get("epoch", 0) for item in history]
-        losses = [item.get("loss", 0.0) for item in history]
-        plt.figure(figsize=(6, 4))
-        plt.plot(epochs, losses, label="loss", color="#1565C0", linewidth=2)
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training Loss Curve")
-        plt.grid(alpha=0.3)
-        loss_path = os.path.join(config.PLOTS_PATH, "training_loss.png")
-        plt.tight_layout()
-        plt.savefig(loss_path, dpi=130)
-        plt.close()
-        outputs.append(loss_path)
-
-        f1 = plot_inputs.get("feature_1", [])
-        f2 = plot_inputs.get("feature_2", [])
-        labels = plot_inputs.get("labels", [])
-        plt.figure(figsize=(6, 4))
-        for idx in range(min(len(f1), len(f2), len(labels))):
-            color = "#1B5E20" if float(labels[idx]) > 0 else "#B71C1C"
-            plt.scatter(float(f1[idx]), float(f2[idx]), c=color, s=18)
-        plt.xlabel("Feature 1 (scaled)")
-        plt.ylabel("Feature 2 (scaled)")
-        plt.title("Feature Projection")
-        scatter_path = os.path.join(config.PLOTS_PATH, "feature_projection.png")
-        plt.tight_layout()
-        plt.savefig(scatter_path, dpi=130)
-        plt.close()
-        outputs.append(scatter_path)
-    except Exception as exc:
-        fallback = os.path.join(config.PLOTS_PATH, "plot_generation_fallback.txt")
-        with open(fallback, "w", encoding="utf-8") as handle:
-            handle.write(f"Matplotlib unavailable: {{exc}}\\n")
-        outputs.append(fallback)
-    return outputs
-
-def evaluate(metrics: dict) -> dict:
-    evaluation = dict(metrics.get("evaluation", {{}}))
-    target = config.TARGET_METRIC
-    if target not in evaluation:
-        target = "accuracy" if "accuracy" in evaluation else next(iter(evaluation.keys()), "accuracy")
-    primary_value = float(evaluation.get(target, 0.0))
-
-    payload = {{
-        "experiment_id": config.EXPERIMENT_ID,
-        "problem_type": PROBLEM_TYPE,
-        "algorithm_class": config.ALGORITHM_CLASS,
-        "algorithm": config.FRAMEWORK + "_" + PROBLEM_TYPE,
-        "framework": config.FRAMEWORK,
-        "target_metric": config.TARGET_METRIC,
-        "primary_metric_name": target,
-        "primary_metric_value": primary_value,
-        "training": {{
-            "epochs": config.MAX_EPOCHS,
-            "final_loss": metrics.get("train_loss", 1.0),
-            "duration_sec": metrics.get("duration_sec", 0.0),
-        }},
-        "evaluation": evaluation,
-        "preprocessing": metrics.get("preprocessing", {{}}),
-        "hardware": config.DEVICE,
-        "seed": config.RANDOM_SEED,
-        "reproducible": True,
-        "quantum": {{
-            "enabled": bool(config.REQUIRES_QUANTUM),
-            "framework": config.QUANTUM_FRAMEWORK or "disabled",
-            "backend": config.QUANTUM_BACKEND or "n/a",
-            "qubits": config.QUBIT_COUNT,
-        }},
-        "artifacts": {{
-            "plots": _generate_plots(metrics),
-            "preprocessing_report_path": os.path.join(config.DATA_PROCESSED_PATH, "preprocessing_report.json"),
-            "training_history_path": os.path.join(config.DATA_PROCESSED_PATH, "training_history.json"),
-            "explanation_path": "",
-        }},
-    }}
-    payload["artifacts"]["explanation_path"] = _write_explanation(payload)
-    write_json(config.METRICS_PATH, payload)
-    return payload
-"""
-
-
-def _main_template() -> str:
-    return """from __future__ import annotations
-from src.train import run_training
-from src.evaluate import evaluate
-import config
-
-def main() -> None:
-    config.set_global_seed()
-    metrics = run_training()
-    result = evaluate(metrics)
-    metric_name = result.get("primary_metric_name", config.TARGET_METRIC)
-    metric_value = result.get("primary_metric_value", result.get("evaluation", {}).get(metric_name, 0.0))
-    print(f"METRIC: {metric_name}={metric_value}")
-    print(f"PLOTS: {result.get('artifacts', {}).get('plots', [])}")
-    print(f"EXPLANATION: {result.get('artifacts', {}).get('explanation_path', '')}")
-
-if __name__ == "__main__":
-    main()
-"""
+    if violations:
+        raise RuntimeError(f"strict_state_only violation after {attempts_used} repair attempts: {violations}")
+    return manifest
 
 
 async def code_gen_agent_node(state: ResearchState) -> ResearchState:
@@ -670,28 +496,21 @@ async def code_gen_agent_node(state: ResearchState) -> ResearchState:
     for rel in required_dirs:
         (project / rel).mkdir(parents=True, exist_ok=True)
 
-    llm_guidance: dict[str, str] = {}
     try:
-        llm_guidance = await _llm_codegen_guidance(state, problem_type, code_level, algorithm_class)
-    except Exception:
-        logger.exception("agent.codegen.llm_guidance_failed", experiment_id=state["experiment_id"])
-        if not settings.ALLOW_RULE_BASED_FALLBACK:
-            raise RuntimeError("Code generation LLM guidance failed and rule-based fallback is disabled.")
-    if llm_guidance:
-        state.setdefault("research_plan", {})["codegen_guidance"] = llm_guidance
+        files = await _generate_dynamic_files(
+            state=state,
+            project=project,
+            problem_type=problem_type,
+            code_level=code_level,
+            algorithm_class=algorithm_class,
+        )
+    except Exception as exc:
+        logger.exception("agent.codegen.dynamic_generation_failed", experiment_id=state["experiment_id"])
+        raise RuntimeError(f"Dynamic code generation failed: {exc}") from exc
 
-    files = {
-        str(project / "config.py"): _config_template(state, problem_type, code_level, algorithm_class, llm_guidance=llm_guidance),
-        str(project / "src" / "__init__.py"): "",
-        str(project / "src" / "utils.py"): _utils_template(),
-        str(project / "src" / "preprocessing.py"): _preprocessing_template(problem_type),
-        str(project / "src" / "model.py"): _model_template(problem_type, code_level),
-        str(project / "src" / "train.py"): _train_template(problem_type, code_level),
-        str(project / "src" / "evaluate.py"): _evaluate_template(problem_type),
-        str(project / "main.py"): _main_template(),
-    }
     if _should_inject_failure("codegen_syntax"):
-        files[str(project / "main.py")] = files[str(project / "main.py")] + "\nthis is invalid python\n"
+        main_path = str((project / "main.py").resolve())
+        files[main_path] = f"{files.get(main_path, '')}\nthis is invalid python\n"
 
     if local_mode:
         plan = state.setdefault("local_file_plan", [])
@@ -709,7 +528,7 @@ async def code_gen_agent_node(state: ResearchState) -> ResearchState:
             phase="code_generator",
             file_operations=planned_files,
             next_phase=next_phase,
-            reason=f"Create generated source files locally ({problem_type}/{code_level}) before scheduling execution",
+            reason=f"Create dynamically generated source files locally ({problem_type}/{code_level}) before scheduling execution",
             cwd=state["project_path"],
         )
         if queued:
@@ -735,3 +554,4 @@ async def code_gen_agent_node(state: ResearchState) -> ResearchState:
         code_level=code_level,
     )
     return state
+

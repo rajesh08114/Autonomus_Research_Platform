@@ -14,9 +14,9 @@ def normalize_execution_mode(value: Any) -> str:
     raw = str(value or "").strip().lower()
     if raw in {VSCODE_EXTENSION_MODE, BACKEND_MODE}:
         return raw
-    fallback = str(settings.EXECUTION_MODE or "").strip().lower()
-    if fallback in {VSCODE_EXTENSION_MODE, BACKEND_MODE}:
-        return fallback
+    configured = str(settings.EXECUTION_MODE or "").strip().lower()
+    if configured in {VSCODE_EXTENSION_MODE, BACKEND_MODE}:
+        return configured
     return VSCODE_EXTENSION_MODE
 
 

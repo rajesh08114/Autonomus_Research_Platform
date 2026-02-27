@@ -78,7 +78,7 @@ The backend keeps a dynamic question plan generated from the prompt and advances
   "research_scope": {"user_id": "alice", "test_mode": false, "collection_key": "user:alice"},
   "execution_target": "local_machine",
   "execution_mode": "vscode_extension",
-  "llm": {"provider": "quantum_llm", "model": "quantum_local_template"},
+  "llm": {"provider": "huggingface", "model": "Qwen/Qwen2.5-7B-Instruct"},
   "pending_questions": {
     "mode": "sequential_dynamic",
     "current_question": {"id": "Q1", "topic": "output_format", "text": "...", "type": "choice", "options": [".py", ".ipynb"]},
@@ -219,8 +219,8 @@ Note: for local actions (`apply_file_operations`, `prepare_venv`, `install_packa
   "pending_action": null,
   "execution_target": "local_machine",
   "execution_mode": "vscode_extension",
-  "llm_provider": "rule_based",
-  "llm_model": "local_structured_fallback",
+  "llm_provider": "huggingface",
+  "llm_model": "Qwen/Qwen2.5-7B-Instruct",
   "progress_pct": 85
 }
 ```
@@ -403,7 +403,7 @@ Response `data` (key fields):
     "history_used": 3,
     "references": [{"experiment_id": "exp_..."}]
   },
-  "generation": {"provider": "rule_based", "strategy": "history_aware_local_fallback"},
+  "generation": {"provider": "huggingface", "strategy": "history_grounded_chat_completion"},
   "token_usage": {"prompt_tokens": 21, "completion_tokens": 75, "total_tokens": 96}
 }
 ```

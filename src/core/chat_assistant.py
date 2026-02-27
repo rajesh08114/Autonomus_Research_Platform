@@ -80,49 +80,6 @@ def _history_to_text(selected: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _rule_based_answer(question: str, selected: list[dict[str, Any]], test_mode: bool) -> tuple[str, list[str]]:
-    if not selected:
-        follow_ups = [
-            "Should I start a new research workflow for this question?",
-            "Do you want AI-only, quantum-only, or hybrid AI+quantum output?",
-        ]
-        return (
-            "No prior research was found in this scope. Start a research run first, then I can answer with grounded history.",
-            follow_ups,
-        )
-
-    wants_plot = any(token in question.lower() for token in ["plot", "chart", "graph", "visual"])
-    wants_preprocess = any(token in question.lower() for token in ["preprocess", "clean", "normalize", "impute"])
-    wants_quantum = any(token in question.lower() for token in ["quantum", "qml", "qiskit", "pennylane", "hybrid"])
-
-    lines = [
-        f"I reviewed {len(selected)} prior research run(s) from {'test unified' if test_mode else 'user'} history.",
-        "Relevant runs:",
-    ]
-    for item in selected[:3]:
-        lines.append(
-            f"{item.get('experiment_id')} | {item.get('framework')} | quantum={item.get('requires_quantum')} "
-            f"| {item.get('target_metric')}={item.get('primary_metric_value')}"
-        )
-
-    recommendations: list[str] = []
-    if wants_preprocess:
-        recommendations.append("Apply imputation, scaling, and seeded train/test split before model training.")
-    if wants_plot:
-        recommendations.append("Generate training-loss, metric-trend, and feature-distribution plots into outputs/plots.")
-    if wants_quantum:
-        recommendations.append("Use a hybrid model with explicit quantum feature map, entangling layers, and backend metadata.")
-    if not recommendations:
-        recommendations.append("Reuse the closest prior run and iterate the metric target and dataset constraints.")
-
-    lines.append("Recommended next step: " + " ".join(recommendations))
-    follow_ups = [
-        "Do you want code output as `.py` scripts or notebook format?",
-        "Should the next run target speed, accuracy, or quantum fidelity?",
-    ]
-    return "\n".join(lines), follow_ups
-
-
 async def _invoke_huggingface_chat(
     question: str,
     selected: list[dict[str, Any]],
@@ -231,6 +188,7 @@ async def generate_chat_response(
     chat_history: list[dict[str, Any]],
     test_mode: bool,
 ) -> dict[str, Any]:
+    _ = test_mode
     provider = settings.effective_master_llm_provider
     if provider == "huggingface" and settings.huggingface_api_key:
         try:
@@ -248,40 +206,7 @@ async def generate_chat_response(
                 success=False,
                 error_message=str(exc),
             )
-            if not settings.ALLOW_RULE_BASED_FALLBACK:
-                raise RuntimeError(f"Hugging Face chat unavailable: {exc}") from exc
-
-    if not settings.ALLOW_RULE_BASED_FALLBACK:
-        raise RuntimeError("Rule-based chat fallback is disabled and Hugging Face provider is unavailable.")
-
-    answer, follow_ups = _rule_based_answer(question, selected_history, test_mode)
-    prompt_tokens = _estimate_tokens(question)
-    completion_tokens = _estimate_tokens(answer)
-    total_tokens = prompt_tokens + completion_tokens
-    await ExperimentRepository.add_llm_usage(
-        provider="rule_based",
-        model="history_retrieval_fallback",
-        phase="chat_assistant",
-        latency_ms=0.1,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        estimated_cost_usd=0.0,
-        success=True,
+            raise RuntimeError(f"Hugging Face chat unavailable: {exc}") from exc
+    raise RuntimeError(
+        "Chat assistant requires Hugging Face LLM. Configure HF_API_KEY (or MASTER_LLM_API_KEY)."
     )
-    return {
-        "answer": answer,
-        "follow_up_questions": follow_ups,
-        "generation": {
-            "provider": "rule_based",
-            "model": "history_retrieval_fallback",
-            "strategy": "history_grounded_local_fallback",
-            "latency_ms": 0.1,
-        },
-        "token_usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "estimated_cost_usd": 0.0,
-        },
-    }

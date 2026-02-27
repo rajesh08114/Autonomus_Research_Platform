@@ -62,10 +62,6 @@ async def get_health(request_id: str = Depends(get_request_id)):
     all_rows, total = await ExperimentRepository.list(limit=1, offset=0)
     _ = (running_rows, all_rows)
     effective_provider = settings.effective_master_llm_provider
-    quantum_endpoint = str(settings.QUANTUM_LLM_ENDPOINT or "").strip()
-    codehub_endpoint = settings.codehub_generate_url
-    quantum_provider = "codehub_backend" if codehub_endpoint else ("remote_endpoint" if quantum_endpoint else "local_template")
-
     data = {
         "status": "healthy" if db_status == "up" else "degraded",
         "version": "2.0.0",
@@ -75,19 +71,7 @@ async def get_health(request_id: str = Depends(get_request_id)):
             "master_llm": {
                 "status": "up" if (effective_provider == "huggingface" and bool(settings.huggingface_api_key)) else "degraded",
                 "provider": effective_provider,
-                "model": settings.huggingface_model_id
-                if effective_provider == "huggingface"
-                else "rule_based_fallback",
-                "rule_based_fallback_enabled": bool(settings.ALLOW_RULE_BASED_FALLBACK),
-            },
-            "quantum_llm": {
-                "status": "up" if codehub_endpoint or quantum_endpoint else "degraded",
-                "provider": quantum_provider,
-                "endpoint": quantum_endpoint,
-                "codehub_enabled": bool(settings.codehub_enabled),
-                "codehub_endpoint": codehub_endpoint,
-                "codehub_internal_api_key_configured": bool(settings.CODEHUB_INTERNAL_API_KEY),
-                "codehub_bearer_token_configured": bool(settings.CODEHUB_BEARER_TOKEN),
+                "model": settings.huggingface_model_id,
             },
             "database": {"status": db_status, "type": "sqlite", "size_mb": db_size_mb},
             "filesystem": {"status": "up", "free_gb": free_gb},
@@ -141,7 +125,7 @@ async def get_metrics(request_id: str = Depends(get_request_id)):
             state = {}
 
         provider = str(state.get("llm_provider") or settings.effective_master_llm_provider)
-        model = str(state.get("llm_model") or ("rule_based_fallback" if settings.effective_master_llm_provider == "rule_based" else settings.huggingface_model_id))
+        model = str(state.get("llm_model") or settings.huggingface_model_id)
         llm_provider_counts[provider] = llm_provider_counts.get(provider, 0) + 1
         llm_model_counts[model] = llm_model_counts.get(model, 0) + 1
 
@@ -187,7 +171,7 @@ async def get_metrics(request_id: str = Depends(get_request_id)):
     top_model = (
         max(llm_model_counts.items(), key=lambda item: item[1])[0]
         if llm_model_counts
-        else ("rule_based_fallback" if settings.effective_master_llm_provider == "rule_based" else settings.huggingface_model_id)
+        else settings.huggingface_model_id
     )
 
     conn = get_connection()

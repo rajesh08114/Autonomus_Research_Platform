@@ -167,16 +167,8 @@ async def start_experiment(
 
     state = new_research_state(experiment_id, project_path, prompt, overrides)
     state["research_type"] = normalized_research_type
-    if normalized_research_type == "quantum":
-        state["llm_provider"] = "quantum_llm"
-        if settings.codehub_enabled:
-            state["llm_model"] = settings.codehub_generate_url
-        else:
-            state["llm_model"] = settings.QUANTUM_LLM_ENDPOINT or "quantum_local_template"
-    else:
-        provider = settings.effective_master_llm_provider
-        state["llm_provider"] = provider
-        state["llm_model"] = settings.huggingface_model_id if provider == "huggingface" else "rule_based_fallback"
+    state["llm_provider"] = "huggingface"
+    state["llm_model"] = settings.huggingface_model_id
     state["execution_target"] = "local_machine"
     state["execution_mode"] = normalize_execution_mode(overrides.get("execution_mode", settings.EXECUTION_MODE))
     logger.info("experiment.start", experiment_id=experiment_id, project_path=project_path)

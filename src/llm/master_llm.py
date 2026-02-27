@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 from typing import Any
 
@@ -19,17 +18,6 @@ def _estimate_tokens(text: str) -> int:
         return 0
     # Rough heuristic for accounting when provider usage metadata is unavailable.
     return max(1, int(len(value) / 4))
-
-
-def _local_structured_fallback() -> str:
-    payload: dict[str, Any] = {
-        "action": "ask_user",
-        "reasoning": "Local structured fallback used while remote provider is unavailable.",
-        "parameters": {"questions": []},
-        "next_step": "planner",
-        "confidence": 0.6,
-    }
-    return json.dumps(payload)
 
 
 async def _invoke_huggingface_chat(
@@ -67,7 +55,16 @@ async def _invoke_huggingface_chat(
             },
             json=payload,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            response_body = (response.text or "").strip().replace("\n", " ")
+            if len(response_body) > 500:
+                response_body = f"{response_body[:500]}..."
+            raise RuntimeError(
+                f"Hugging Face API returned HTTP {response.status_code} at {url} "
+                f"for model '{model}'. Response: {response_body}"
+            ) from exc
         body = response.json()
     latency_ms = (time.time() - started) * 1000.0
 
@@ -124,49 +121,40 @@ async def invoke_master_llm(
     """
     provider = settings.effective_master_llm_provider
     logger.info("llm.invoke.start", provider=provider)
-    if provider == "rule_based":
-        if not settings.ALLOW_RULE_BASED_FALLBACK:
-            raise RuntimeError("Rule-based fallback is disabled. Configure HF_API_KEY for autonomous LLM execution.")
-        content = _local_structured_fallback()
-        prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
-        completion_tokens = _estimate_tokens(content)
-        total_tokens = prompt_tokens + completion_tokens
+    if provider not in {"huggingface", "hf", "hugging_face"}:
+        raise RuntimeError(
+            "Only HuggingFace provider is supported in LLM-only mode. "
+            "Set MASTER_LLM_PROVIDER=huggingface and configure HF_API_KEY (or MASTER_LLM_API_KEY)."
+        )
+    try:
+        return await _invoke_huggingface_chat(
+            system_prompt,
+            user_prompt,
+            experiment_id=experiment_id,
+            phase=phase,
+        )
+    except Exception as exc:
+        logger.exception("llm.huggingface.error")
         await ExperimentRepository.add_llm_usage(
             experiment_id=experiment_id,
             phase=phase,
-            provider="rule_based",
-            model="local_structured_fallback",
-            latency_ms=0.1,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            estimated_cost_usd=0.0,
-            success=True,
+            provider="huggingface",
+            model=settings.huggingface_model_id,
+            latency_ms=0.0,
+            prompt_tokens=_estimate_tokens(system_prompt) + _estimate_tokens(user_prompt),
+            success=False,
+            error_message=str(exc),
         )
-        return content
-    if provider in {"huggingface", "hf", "hugging_face"}:
-        try:
-            return await _invoke_huggingface_chat(
-                system_prompt,
-                user_prompt,
-                experiment_id=experiment_id,
-                phase=phase,
-            )
-        except Exception as exc:
-            logger.exception("llm.huggingface.error")
-            await ExperimentRepository.add_llm_usage(
-                experiment_id=experiment_id,
-                phase=phase,
-                provider="huggingface",
-                model=settings.huggingface_model_id,
-                latency_ms=0.0,
-                prompt_tokens=_estimate_tokens(system_prompt) + _estimate_tokens(user_prompt),
-                success=False,
-                error_message=str(exc),
-            )
-            if settings.ALLOW_RULE_BASED_FALLBACK:
-                return _local_structured_fallback()
-            raise RuntimeError(f"Hugging Face invocation failed: {exc}") from exc
+        raise RuntimeError(f"Hugging Face invocation failed: {exc}") from exc
 
-    # Placeholder for provider-specific integration in production.
-    raise RuntimeError(f"Configured master LLM provider '{provider}' is not implemented.")
+
+async def assert_master_llm_ready() -> None:
+    """Fail fast when master LLM is not reachable at startup."""
+    if not settings.huggingface_api_key:
+        raise RuntimeError("HF_API_KEY (or MASTER_LLM_API_KEY) is required for startup readiness.")
+    await _invoke_huggingface_chat(
+        system_prompt="You are a health-check assistant. Return compact JSON.",
+        user_prompt='Return exactly {"status":"ok"}',
+        experiment_id=None,
+        phase="startup_readiness",
+    )

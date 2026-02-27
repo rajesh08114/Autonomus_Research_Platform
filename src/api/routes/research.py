@@ -31,17 +31,12 @@ logger = get_logger(__name__)
 async def post_start(request: StartResearchRequest, request_id: str = Depends(get_request_id)):
     logger.info("api.research.start", request_id=request_id, prompt_len=len(request.prompt), research_type=request.research_type)
     normalized_research_type = str(request.research_type or "ai").strip().lower()
-    if (
-        normalized_research_type != "quantum"
-        and settings.effective_master_llm_provider == "huggingface"
-        and not settings.huggingface_api_key
-        and not settings.ALLOW_RULE_BASED_FALLBACK
-    ):
+    if settings.effective_master_llm_provider == "huggingface" and not settings.huggingface_api_key:
         raise HTTPException(
             status_code=400,
             detail=error_payload(
                 "LLM_CONFIGURATION_ERROR",
-                "HF_API_KEY (or MASTER_LLM_API_KEY) is required when ALLOW_RULE_BASED_FALLBACK=false.",
+                "HF_API_KEY (or MASTER_LLM_API_KEY) is required.",
             ),
         )
     experiment_id = await start_experiment(

@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 from src.config.settings import settings
 from src.core.logger import get_logger
 from src.db.repository import ExperimentRepository
+from src.llm.dynamic_parser import parse_json_object
+from src.llm.master_llm import invoke_master_llm
 from src.state.research_state import ResearchState
 
 logger = get_logger(__name__)
@@ -49,6 +52,73 @@ def _quantum_benchmarks(state: ResearchState, metrics: dict[str, object]) -> dic
     }
 
 
+async def _invoke_evaluator_dynamic_summary(state: ResearchState, metrics: dict[str, Any]) -> dict[str, Any]:
+    system_prompt = (
+        "SYSTEM ROLE: evaluator_dynamic_interpretation.\n"
+        "Return JSON only with keys:\n"
+        "- summary_text (string)\n"
+        "- insights (array of strings)\n"
+        "- warnings (array of strings)\n"
+        "- next_steps (array of strings)\n"
+        "Keep each list concise and actionable."
+    )
+    user_prompt = json.dumps(
+        {
+            "target_metric": state.get("target_metric"),
+            "metrics": metrics,
+            "research_plan": state.get("research_plan", {}),
+            "framework": state.get("framework"),
+            "requires_quantum": state.get("requires_quantum"),
+            "dataset_source": state.get("dataset_source"),
+        },
+        indent=2,
+        default=str,
+    )
+    raw = await invoke_master_llm(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        experiment_id=state["experiment_id"],
+        phase="results_evaluator",
+    )
+    state["llm_calls_count"] = int(state.get("llm_calls_count", 0)) + 1
+    parsed = parse_json_object(raw)
+    if not parsed:
+        logger.warning("agent.evaluator.dynamic_parse_failed", experiment_id=state["experiment_id"])
+    return parsed
+
+
+def _clean_text_list(value: Any, limit: int = 5) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for raw in value:
+        text = str(raw or "").strip()
+        if text and text not in items:
+            items.append(text[:300])
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _sanitize_dynamic_interpretation(payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    violations: list[str] = []
+    summary_text = str(payload.get("summary_text", "")).strip()
+    insights = _clean_text_list(payload.get("insights"), limit=6)
+    warnings = _clean_text_list(payload.get("warnings"), limit=6)
+    next_steps = _clean_text_list(payload.get("next_steps"), limit=6)
+    if not summary_text:
+        violations.append("summary_text must be non-empty")
+    if not insights:
+        violations.append("insights must be a non-empty string array")
+    interpretation = {
+        "summary_text": summary_text[:1000],
+        "insights": insights,
+        "warnings": warnings,
+        "next_steps": next_steps,
+    }
+    return interpretation, violations
+
+
 async def evaluator_agent_node(state: ResearchState) -> ResearchState:
     state["phase"] = "results_evaluator"
     logger.info("agent.evaluator.start", experiment_id=state["experiment_id"])
@@ -74,8 +144,7 @@ async def evaluator_agent_node(state: ResearchState) -> ResearchState:
         evaluation_map = {}
         metrics["evaluation"] = evaluation_map
     if state["target_metric"] not in evaluation_map:
-        fallback_value = float(evaluation_map.get("accuracy", 0.0))
-        evaluation_map[state["target_metric"]] = fallback_value
+        raise RuntimeError(f"Missing target metric '{state['target_metric']}' in evaluation output.")
 
     if state.get("requires_quantum"):
         qb = _quantum_benchmarks(state, metrics)
@@ -88,6 +157,35 @@ async def evaluator_agent_node(state: ResearchState) -> ResearchState:
     if isinstance(artifacts, dict):
         plots = artifacts.get("plots", [])
         state["plots_generated"] = [str(item) for item in plots] if isinstance(plots, list) else []
+
+    dynamic_interpretation: dict[str, Any] = {}
+    used_dynamic = False
+    fallback_static = False
+    payload_keys: list[str] = []
+    payload = await _invoke_evaluator_dynamic_summary(state, metrics)
+    if not payload:
+        if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+            fallback_static = True
+            logger.warning("agent.evaluator.dynamic_fallback_static", experiment_id=state["experiment_id"], reason="parse_failed")
+        else:
+            raise RuntimeError("Evaluator dynamic interpretation parse failed")
+    else:
+        payload_keys = sorted(list(payload.keys()))
+        dynamic_interpretation, violations = _sanitize_dynamic_interpretation(payload)
+        if violations:
+            logger.warning("agent.evaluator.dynamic_validation_failed", experiment_id=state["experiment_id"], violations=violations)
+            if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                fallback_static = True
+                logger.warning(
+                    "agent.evaluator.dynamic_fallback_static",
+                    experiment_id=state["experiment_id"],
+                    reason="validation_failed",
+                )
+                dynamic_interpretation = {}
+            else:
+                raise RuntimeError(f"Evaluator dynamic interpretation validation failed: {violations}")
+        else:
+            used_dynamic = True
 
     state["metrics"] = metrics
     if settings.METRICS_TABLE_ENABLED:
@@ -108,6 +206,13 @@ async def evaluator_agent_node(state: ResearchState) -> ResearchState:
         "seed": state["random_seed"],
         "reproducible": True,
         "plots": state["plots_generated"],
+        "dynamic_interpretation": dynamic_interpretation,
+    }
+    state.setdefault("research_plan", {})["evaluator_dynamic_summary"] = {
+        "used_dynamic": used_dynamic,
+        "fallback_static": fallback_static,
+        "payload_keys": payload_keys,
     }
     logger.info("agent.evaluator.end", experiment_id=state["experiment_id"], primary_metric=state["target_metric"], primary_value=primary)
     return state
+

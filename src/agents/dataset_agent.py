@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+import re
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,14 @@ from src.core.execution_mode import is_vscode_execution_mode, local_python_comma
 from src.core.file_manager import write_text_file
 from src.core.local_actions import queue_local_file_action
 from src.core.logger import get_logger
+from src.llm.dynamic_parser import parse_json_object
+from src.llm.master_llm import invoke_master_llm
 from src.state.research_state import ResearchState
 
 logger = get_logger(__name__)
+
+_ALLOWED_CHECK_TYPES = {"min_rows", "required_columns", "target_binary", "target_numeric"}
+_SAFE_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
 def _should_inject_failure(point: str) -> bool:
@@ -65,7 +71,7 @@ def _synthetic_rows(state: ResearchState) -> list[tuple[float, float, float, int
     return rows
 
 
-def _sklearn_rows(state: ResearchState) -> tuple[list[tuple[float, float, float, int | float]], str | None]:
+def _sklearn_rows(state: ResearchState) -> list[tuple[float, float, float, int | float]]:
     try:
         problem_type = _resolve_problem_type(state)
         if problem_type == "regression":
@@ -78,7 +84,7 @@ def _sklearn_rows(state: ResearchState) -> tuple[list[tuple[float, float, float,
             ds = load_wine(as_frame=True)
         frame = ds.frame
         if frame is None or frame.empty:
-            return _synthetic_rows(state), "sklearn_dataset_empty_fallback_to_synthetic"
+            raise RuntimeError("sklearn dataset is empty")
         feature_names = list(ds.feature_names[:3]) if ds.feature_names else list(frame.columns[:3])
         rows: list[tuple[float, float, float, int | float]] = []
         for _, row in frame.iterrows():
@@ -91,10 +97,10 @@ def _sklearn_rows(state: ResearchState) -> tuple[list[tuple[float, float, float,
                 target = 1 if int(row.get("target", 0)) > 0 else 0
             rows.append((f1, f2, f3, target))
         if not rows:
-            return _synthetic_rows(state), "sklearn_no_rows_fallback_to_synthetic"
-        return rows, None
-    except Exception:
-        return _synthetic_rows(state), "sklearn_import_fallback_to_synthetic"
+            raise RuntimeError("sklearn dataset has no rows")
+        return rows
+    except Exception as exc:
+        raise RuntimeError(f"sklearn dataset load failed: {exc}") from exc
 
 
 def _to_float(value: Any) -> float | None:
@@ -169,11 +175,7 @@ def _select_rows_for_source(state: ResearchState, raw_dir: Path) -> tuple[list[t
     if source == "synthetic":
         return _synthetic_rows(state), metadata
     if source == "sklearn":
-        rows, note = _sklearn_rows(state)
-        if note:
-            metadata["source_note"] = note
-            metadata["resolved_source"] = "synthetic"
-        return rows, metadata
+        return _sklearn_rows(state), metadata
     if source in {"upload", "kaggle"}:
         external_path = _find_external_csv(raw_dir)
         if external_path:
@@ -182,17 +184,221 @@ def _select_rows_for_source(state: ResearchState, raw_dir: Path) -> tuple[list[t
                 metadata["resolved_source"] = source
                 metadata["source_file"] = str(external_path)
                 return loaded, metadata
-            metadata["source_note"] = "external_csv_parse_failed_fallback_to_synthetic"
-        else:
-            metadata["source_note"] = f"{source}_dataset_not_found_fallback_to_synthetic"
-        metadata["resolved_source"] = "synthetic"
-        return _synthetic_rows(state), metadata
-    metadata["source_note"] = "unknown_dataset_source_fallback_to_synthetic"
-    metadata["resolved_source"] = "synthetic"
-    return _synthetic_rows(state), metadata
+            raise RuntimeError(f"{source} CSV parse failed: {external_path.name}")
+        raise RuntimeError(f"{source} dataset source requires a CSV file in data/raw")
+    raise RuntimeError(f"Unsupported dataset source: {source}")
 
 
-def _dataset_report(path: Path, rows: list[tuple[float, float, float, int | float]], source_meta: dict[str, Any]) -> dict[str, Any]:
+def _default_dataset_plan(problem_type: str) -> dict[str, Any]:
+    target_check = "target_numeric" if problem_type == "regression" else "target_binary"
+    return {
+        "schema_mapping": {
+            "feature_1": "feature_1",
+            "feature_2": "feature_2",
+            "feature_3": "feature_3",
+            "target": "target",
+        },
+        "validation_checks": [
+            {"type": "required_columns", "value": ["feature_1", "feature_2", "feature_3", "target"]},
+            {"type": "min_rows", "value": 10},
+            {"type": target_check, "value": True},
+        ],
+        "report_narrative": {
+            "summary": "Dataset was normalized to feature_1/feature_2/feature_3/target contract.",
+            "quality_notes": ["Schema validated against required columns and minimum row count."],
+        },
+    }
+
+
+async def _invoke_dataset_plan_llm(state: ResearchState, source_meta: dict[str, Any]) -> dict[str, Any]:
+    system_prompt = (
+        "SYSTEM ROLE: dataset_dynamic_plan.\n"
+        "Return JSON only with keys:\n"
+        "- schema_mapping: object with keys feature_1, feature_2, feature_3, target and string values.\n"
+        "- validation_checks: array of objects with keys type and value.\n"
+        "- report_narrative: object with keys summary (string) and quality_notes (string array).\n"
+        "Allowed validation check types: min_rows, required_columns, target_binary, target_numeric.\n"
+        "Do not return executable code."
+    )
+    user_prompt = json.dumps(
+        {
+            "dataset_source": state.get("dataset_source"),
+            "framework": state.get("framework"),
+            "problem_type": _resolve_problem_type(state),
+            "target_metric": state.get("target_metric"),
+            "required_packages": state.get("required_packages"),
+            "research_plan": state.get("research_plan", {}),
+            "source_meta": source_meta,
+        },
+        indent=2,
+        default=str,
+    )
+    raw = await invoke_master_llm(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        experiment_id=state["experiment_id"],
+        phase="dataset_manager",
+    )
+    state["llm_calls_count"] = int(state.get("llm_calls_count", 0)) + 1
+    parsed = parse_json_object(raw)
+    if not parsed:
+        logger.warning("agent.dataset.dynamic_parse_failed", experiment_id=state["experiment_id"])
+    return parsed
+
+
+def _sanitize_dataset_plan(plan: dict[str, Any], problem_type: str) -> tuple[dict[str, Any], list[str]]:
+    violations: list[str] = []
+    mapping_raw = plan.get("schema_mapping")
+    mapping: dict[str, str] = {}
+    if not isinstance(mapping_raw, dict):
+        violations.append("schema_mapping must be an object")
+    else:
+        for key in ("feature_1", "feature_2", "feature_3", "target"):
+            value = str(mapping_raw.get(key, "")).strip()
+            if not value:
+                violations.append(f"schema_mapping missing value for {key}")
+                continue
+            if not _SAFE_COLUMN_RE.match(value):
+                violations.append(f"schema_mapping has unsafe column name for {key}: {value}")
+                continue
+            mapping[key] = value
+
+    checks: list[dict[str, Any]] = []
+    checks_raw = plan.get("validation_checks")
+    if not isinstance(checks_raw, list):
+        violations.append("validation_checks must be an array")
+    else:
+        for idx, item in enumerate(checks_raw):
+            if not isinstance(item, dict):
+                violations.append(f"validation_checks[{idx}] must be an object")
+                continue
+            check_type = str(item.get("type", "")).strip().lower()
+            if check_type not in _ALLOWED_CHECK_TYPES:
+                violations.append(f"validation_checks[{idx}] unsupported type: {check_type}")
+                continue
+            value = item.get("value")
+            if check_type == "min_rows":
+                try:
+                    value = int(value)
+                except Exception:
+                    violations.append("min_rows value must be integer")
+                    continue
+                value = max(1, min(value, 1_000_000))
+            elif check_type == "required_columns":
+                if not isinstance(value, list):
+                    violations.append("required_columns value must be array")
+                    continue
+                clean_cols: list[str] = []
+                for col in value:
+                    col_name = str(col).strip()
+                    if col_name and _SAFE_COLUMN_RE.match(col_name):
+                        clean_cols.append(col_name)
+                if not clean_cols:
+                    violations.append("required_columns must include at least one safe column")
+                    continue
+                value = clean_cols[:20]
+            elif check_type in {"target_binary", "target_numeric"}:
+                value = bool(value)
+            checks.append({"type": check_type, "value": value})
+
+    narrative_raw = plan.get("report_narrative")
+    narrative: dict[str, Any] = {"summary": "", "quality_notes": []}
+    if not isinstance(narrative_raw, dict):
+        violations.append("report_narrative must be an object")
+    else:
+        summary = str(narrative_raw.get("summary", "")).strip()
+        notes_raw = narrative_raw.get("quality_notes", [])
+        notes = [str(item).strip() for item in notes_raw] if isinstance(notes_raw, list) else []
+        notes = [item for item in notes if item][:8]
+        narrative = {"summary": summary[:500], "quality_notes": [item[:200] for item in notes]}
+
+    target_check = "target_numeric" if problem_type == "regression" else "target_binary"
+    if not any(str(item.get("type")) == target_check for item in checks):
+        checks.append({"type": target_check, "value": True})
+    if not any(str(item.get("type")) == "required_columns" for item in checks):
+        checks.append({"type": "required_columns", "value": ["feature_1", "feature_2", "feature_3", "target"]})
+    if not any(str(item.get("type")) == "min_rows" for item in checks):
+        checks.append({"type": "min_rows", "value": 10})
+
+    sanitized = {"schema_mapping": mapping, "validation_checks": checks, "report_narrative": narrative}
+    return sanitized, violations
+
+
+def _build_validation_script(project_path: str, plan: dict[str, Any]) -> str:
+    checks_json = json.dumps(plan.get("validation_checks", []), indent=2)
+    return f"""from __future__ import annotations
+import csv
+import json
+from pathlib import Path
+
+raw_dir = Path(r\"{project_path}\") / "data" / "raw"
+path = raw_dir / "dataset.csv"
+if not path.exists():
+    raise SystemExit("DATA_ERROR: dataset.csv not found")
+
+with path.open("r", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    rows = [dict(item) for item in reader]
+
+columns = list(rows[0].keys()) if rows else []
+checks = json.loads(r'''{checks_json}''')
+
+for check in checks:
+    ctype = str(check.get("type", ""))
+    cvalue = check.get("value")
+    if ctype == "min_rows":
+        if len(rows) < int(cvalue):
+            raise SystemExit(f"DATA_ERROR: expected at least {{int(cvalue)}} rows, got {{len(rows)}}")
+    elif ctype == "required_columns":
+        required = [str(item) for item in (cvalue or [])]
+        missing = [name for name in required if name not in columns]
+        if missing:
+            raise SystemExit(f"DATA_ERROR: missing columns {{missing}}")
+    elif ctype == "target_binary":
+        if rows and bool(cvalue):
+            bad = []
+            for idx, row in enumerate(rows[:1000]):
+                value = str(row.get("target", "")).strip()
+                if value not in {{"0", "1", "0.0", "1.0", "true", "false", "True", "False"}}:
+                    bad.append(idx)
+                    if len(bad) >= 5:
+                        break
+            if bad:
+                raise SystemExit(f"DATA_ERROR: non-binary target values at rows {{bad}}")
+    elif ctype == "target_numeric":
+        if rows and bool(cvalue):
+            bad = []
+            for idx, row in enumerate(rows[:1000]):
+                value = str(row.get("target", "")).strip()
+                try:
+                    float(value)
+                except Exception:
+                    bad.append(idx)
+                    if len(bad) >= 5:
+                        break
+            if bad:
+                raise SystemExit(f"DATA_ERROR: non-numeric target values at rows {{bad}}")
+
+report = {{
+    "filename": path.name,
+    "shape": [len(rows), len(columns)],
+    "columns": columns,
+    "sample_rows": rows[:5]
+}}
+out_path = Path(r\"{project_path}\") / "data" / "data_report.json"
+out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+print("DATA_REPORT:", json.dumps(report))
+print("DATA_VALID: true")
+"""
+
+
+def _dataset_report(
+    path: Path,
+    rows: list[tuple[float, float, float, int | float]],
+    source_meta: dict[str, Any],
+    dataset_plan: dict[str, Any],
+    used_dynamic_plan: bool,
+) -> dict[str, Any]:
     problem_type = str(source_meta.get("problem_type", "classification"))
     target_dtype = "float" if problem_type == "regression" else "int"
     sample: list[dict[str, Any]] = []
@@ -209,13 +415,19 @@ def _dataset_report(path: Path, rows: list[tuple[float, float, float, int | floa
         "class_distribution": {"0": sum(1 for row in rows if float(row[3]) <= 0.5), "1": sum(1 for row in rows if float(row[3]) > 0.5)},
         "sample_rows": sample,
         "source": source_meta,
+        "dynamic_plan": {
+            "enabled": bool(settings.DATASET_DYNAMIC_ENABLED),
+            "used_dynamic_plan": used_dynamic_plan,
+            "schema_mapping": dataset_plan.get("schema_mapping", {}),
+            "validation_checks": dataset_plan.get("validation_checks", []),
+            "report_narrative": dataset_plan.get("report_narrative", {}),
+        },
     }
     return report
 
 
 def _kaggle_download_script(project_path: str, dataset_id: str) -> str:
     return f"""from __future__ import annotations
-import os
 import subprocess
 from pathlib import Path
 
@@ -233,36 +445,6 @@ if result.returncode != 0:
 """
 
 
-def _validation_script(project_path: str) -> str:
-    return f"""from __future__ import annotations
-import csv
-import json
-from pathlib import Path
-
-raw_dir = Path(r\"{project_path}\") / "data" / "raw"
-csv_files = list(raw_dir.glob("*.csv"))
-if not csv_files:
-    raise SystemExit("DATA_ERROR: No CSV files found")
-path = csv_files[0]
-rows = []
-with path.open("r", encoding="utf-8") as handle:
-    reader = csv.DictReader(handle)
-    for row in reader:
-        rows.append(row)
-columns = list(rows[0].keys()) if rows else []
-report = {{
-    "filename": path.name,
-    "shape": [len(rows), len(columns)],
-    "columns": columns,
-    "sample_rows": rows[:5]
-}}
-out_path = Path(r\"{project_path}\") / "data" / "data_report.json"
-out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-print("DATA_REPORT:", json.dumps(report))
-print("DATA_VALID: true")
-"""
-
-
 async def dataset_agent_node(state: ResearchState) -> ResearchState:
     state["phase"] = "dataset_manager"
     requested_source = str(state.get("dataset_source", "synthetic")).strip().lower() or "synthetic"
@@ -274,7 +456,48 @@ async def dataset_agent_node(state: ResearchState) -> ResearchState:
     dataset_csv = raw_dir / "dataset.csv"
 
     rows, source_meta = _select_rows_for_source(state, raw_dir)
-    report = _dataset_report(dataset_csv, rows, source_meta)
+    problem_type = _resolve_problem_type(state)
+    dataset_plan = _default_dataset_plan(problem_type)
+    used_dynamic_plan = False
+    fallback_static = False
+
+    if settings.DATASET_DYNAMIC_ENABLED:
+        plan_payload = await _invoke_dataset_plan_llm(state, source_meta)
+        if not plan_payload:
+            if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                logger.warning("agent.dataset.dynamic_fallback_static", experiment_id=state["experiment_id"], reason="parse_failed")
+                fallback_static = True
+            else:
+                raise RuntimeError("Dataset dynamic planning failed: empty/invalid LLM JSON response")
+        else:
+            parsed_plan, violations = _sanitize_dataset_plan(plan_payload, problem_type)
+            if violations:
+                logger.warning("agent.dataset.dynamic_validation_failed", experiment_id=state["experiment_id"], violations=violations)
+                if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
+                    logger.warning(
+                        "agent.dataset.dynamic_fallback_static",
+                        experiment_id=state["experiment_id"],
+                        reason="validation_failed",
+                    )
+                    fallback_static = True
+                else:
+                    raise RuntimeError(f"Dataset dynamic plan validation failed: {violations}")
+            else:
+                dataset_plan = parsed_plan
+                used_dynamic_plan = True
+    state.setdefault("research_plan", {})["dataset_dynamic_plan_summary"] = {
+        "enabled": bool(settings.DATASET_DYNAMIC_ENABLED),
+        "used_dynamic_plan": used_dynamic_plan,
+        "fallback_static": fallback_static,
+        "validation_checks": dataset_plan.get("validation_checks", []),
+        "schema_mapping": dataset_plan.get("schema_mapping", {}),
+    }
+
+    report = _dataset_report(dataset_csv, rows, source_meta, dataset_plan, used_dynamic_plan)
+    if "shape" not in report or "columns" not in report:
+        raise RuntimeError("Dataset report contract violation: missing shape/columns")
+    if "source" not in report:
+        report["source"] = source_meta
     csv_text = _rows_to_csv(rows)
     if _should_inject_failure("dataset_corruption"):
         csv_text = "bad_col\ncorrupted_row\n"
@@ -286,7 +509,7 @@ async def dataset_agent_node(state: ResearchState) -> ResearchState:
     validate_path = project / "data" / "validate_data.py"
     planned_files = [
         {"path": str(dataset_csv), "content": csv_text, "phase": "dataset_manager"},
-        {"path": str(validate_path), "content": _validation_script(state["project_path"]), "phase": "dataset_manager"},
+        {"path": str(validate_path), "content": _build_validation_script(state["project_path"], dataset_plan), "phase": "dataset_manager"},
         {
             "path": str(project / "data" / "data_report.json"),
             "content": json.dumps(report, indent=2),
