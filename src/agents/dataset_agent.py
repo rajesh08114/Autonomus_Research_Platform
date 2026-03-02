@@ -4,15 +4,17 @@ import csv
 import json
 import random
 import re
+import sys
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
 from src.config.settings import settings
-from src.core.execution_mode import is_vscode_execution_mode, local_python_command
+from src.core.execution_mode import is_vscode_execution_mode, local_python_for_state
 from src.core.file_manager import write_text_file
 from src.core.local_actions import queue_local_file_action
 from src.core.logger import get_logger
+from src.core.user_behavior import build_user_behavior_profile
 from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
 from src.state.research_state import ResearchState
@@ -463,6 +465,7 @@ async def _invoke_dataset_plan_llm(state: ResearchState, source_meta: dict[str, 
             "required_packages": state.get("required_packages"),
             "research_plan": state.get("research_plan", {}),
             "source_meta": source_meta,
+            "user_behavior_profile": build_user_behavior_profile(state),
         },
         indent=2,
         default=str,
@@ -748,7 +751,8 @@ async def dataset_agent_node(state: ResearchState) -> ResearchState:
     local_mode = is_vscode_execution_mode(state)
     project = Path(state["project_path"])
     raw_dir = project / "data" / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    if not local_mode:
+        raw_dir.mkdir(parents=True, exist_ok=True)
     dataset_csv = raw_dir / "dataset.csv"
 
     rows, source_meta = _select_rows_for_source(state, raw_dir)
@@ -824,6 +828,14 @@ async def dataset_agent_node(state: ResearchState) -> ResearchState:
         )
 
     if local_mode:
+        local_python = local_python_for_state(state)
+        if settings.EXPERIMENT_VENV_ENABLED:
+            venv_path = Path(state.get("venv_path") or "")
+            venv_python = venv_path / ("Scripts" if sys.platform.startswith("win") else "bin") / (
+                "python.exe" if sys.platform.startswith("win") else "python"
+            )
+            if venv_python.exists():
+                local_python = str(venv_python)
         plan = state.setdefault("local_file_plan", [])
         plan.extend(planned_files)
         for item in planned_files:
@@ -835,7 +847,7 @@ async def dataset_agent_node(state: ResearchState) -> ResearchState:
             file_operations=planned_files,
             next_phase="code_generator",
             reason=f"Create dataset artifacts locally for source={requested_source}",
-            commands=[local_python_command(), str(validate_path)],
+            commands=[local_python, str(validate_path)],
             cwd=state["project_path"],
             timeout_seconds=int(settings.SUBPROCESS_TIMEOUT),
         )

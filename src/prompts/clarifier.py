@@ -27,6 +27,7 @@ ACCURACY RULES:
   output_format, algorithm_class, requires_quantum, quantum_framework,
   dataset_source, kaggle_dataset_id, target_metric, problem_type, code_level,
   hardware_target, random_seed, max_epochs.
+- For output_format questions, prefer choices: ".py", ".ipynb", "hybrid".
 
 RESEARCH TYPE:
 {research_type}

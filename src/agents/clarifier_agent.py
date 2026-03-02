@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from src.core.logger import get_logger
+from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
 from src.llm.response_parser import parse_json_response
 from src.prompts.clarifier import SYSTEM_PROMPT
@@ -12,7 +13,7 @@ from src.state.research_state import ExperimentStatus, ResearchState
 
 logger = get_logger(__name__)
 
-MAX_DYNAMIC_QUESTIONS = 12
+MAX_DYNAMIC_QUESTIONS = 8
 _ALLOWED_TYPES = {"choice", "text", "boolean", "number"}
 _TRUE_VALUES = {"1", "true", "yes", "y", "on", "enable", "enabled"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off", "disable", "disabled"}
@@ -22,7 +23,7 @@ def _infer_prompt_flags(prompt: str) -> dict[str, bool]:
     lower = prompt.lower()
     return {
         "requires_quantum_hint": any(token in lower for token in ["quantum", "vqe", "qaoa", "qnn", "circuit"]),
-        "wants_notebook_hint": any(token in lower for token in ["notebook", "jupyter", ".ipynb"]),
+        "wants_notebook_hint": any(token in lower for token in ["notebook", "jupyter", ".ipynb", "hybrid"]),
         "wants_cuda_hint": "cuda" in lower or "gpu" in lower,
         "kaggle_hint": "kaggle" in lower,
         "wants_low_code_hint": any(token in lower for token in ["simple", "basic", "beginner", "easy"]),
@@ -95,7 +96,15 @@ def _normalize_choice(value: Any, options: list[str], default: Any = None) -> An
 
 
 def _extract_questions(raw: str) -> list[dict[str, Any]]:
-    parsed = parse_json_response(raw)
+    parsed = parse_json_object(raw)
+    if not parsed:
+        try:
+            fallback = parse_json_response(raw)
+            parsed = fallback if isinstance(fallback, dict) else {}
+        except Exception:
+            parsed = {}
+    if not parsed:
+        return []
     if not isinstance(parsed, dict):
         return []
     if isinstance(parsed.get("questions"), list):
@@ -190,6 +199,7 @@ async def _generate_question_plan(
 
 def coerce_answer_value(question: dict[str, Any], value: Any) -> Any:
     qtype = _normalize_topic(str(question.get("type", "text")))
+    topic = _normalize_topic(str(question.get("topic", "")))
     if qtype == "boolean":
         normalized = _normalize_bool(value)
         if normalized is not None:
@@ -203,6 +213,10 @@ def coerce_answer_value(question: dict[str, Any], value: Any) -> Any:
         default_number = _normalize_int(question.get("default"))
         return default_number if default_number is not None else 0
     if qtype == "choice":
+        if topic == "output_format":
+            requested = str(value or "").strip().lower()
+            if requested in {".py", ".ipynb", "hybrid"}:
+                return requested
         options = [str(opt).strip() for opt in question.get("options", []) if str(opt).strip()]
         return _normalize_choice(value, options, default=question.get("default"))
     return value

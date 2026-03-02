@@ -49,6 +49,12 @@ The backend keeps a dynamic question plan generated from the prompt and advances
 ### Endpoint
 `POST /research/start`
 
+Domain guard:
+- Domain is classified by the backend LLM (`ai`, `quantum`, or `unsupported`).
+- Only prompts classified as AI/ML or Quantum are accepted.
+- Non-supported domains return `400` with code `UNSUPPORTED_RESEARCH_DOMAIN`.
+- If classifier service is temporarily unavailable, start returns `503` with code `DOMAIN_CLASSIFIER_UNAVAILABLE`.
+
 ### Request Body
 
 ```json
@@ -62,10 +68,16 @@ The backend keeps a dynamic question plan generated from the prompt and advances
   "config_overrides": {
     "random_seed": 42,
     "hardware_target": "cpu",
-    "max_epochs": 20
+    "max_epochs": 20,
+    "default_allow_research": true
   }
 }
 ```
+
+`config_overrides.default_allow_research=true` enables fully automatic flow:
+- Clarification questions are auto-answered with safe defaults.
+- Pending approval actions are auto-confirmed in non-local execution modes.
+- In VS Code local mode, extension auto-runs pending local actions and posts confirmations.
 
 ### Response `data` (important fields)
 
@@ -78,11 +90,12 @@ The backend keeps a dynamic question plan generated from the prompt and advances
   "research_scope": {"user_id": "alice", "test_mode": false, "collection_key": "user:alice"},
   "execution_target": "local_machine",
   "execution_mode": "vscode_extension",
+  "default_allow_research": true,
   "llm": {"provider": "huggingface", "model": "Qwen/Qwen2.5-7B-Instruct"},
   "pending_questions": {
     "mode": "sequential_dynamic",
-    "current_question": {"id": "Q1", "topic": "output_format", "text": "...", "type": "choice", "options": [".py", ".ipynb"]},
-    "questions": [{"id": "Q1", "topic": "output_format", "text": "...", "type": "choice", "options": [".py", ".ipynb"]}],
+    "current_question": {"id": "Q1", "topic": "output_format", "text": "...", "type": "choice", "options": [".py", ".ipynb", "hybrid"]},
+    "questions": [{"id": "Q1", "topic": "output_format", "text": "...", "type": "choice", "options": [".py", ".ipynb", "hybrid"]}],
     "asked_question_ids": [],
     "answered_count": 0,
     "total_questions_planned": 7

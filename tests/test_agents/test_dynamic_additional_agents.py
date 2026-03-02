@@ -24,6 +24,12 @@ async def test_planner_dynamic_success(tmp_path):
     assert summary.get("fallback_static") is False
     assert "seaborn==0.13.2" in updated.get("required_packages", [])
     assert isinstance(updated["research_plan"].get("methodology"), list) and updated["research_plan"]["methodology"]
+    assert updated["status"] == ExperimentStatus.WAITING.value
+    pending = updated.get("pending_user_confirm") or {}
+    assert pending.get("action") == "apply_file_operations"
+    assert pending.get("phase") == "planner"
+    assert pending.get("next_phase") == "env_manager"
+    assert any(str(item.get("mode", "")).lower() == "mkdir" for item in pending.get("file_operations", []))
 
 
 @pytest.mark.asyncio
@@ -97,4 +103,3 @@ async def test_evaluator_dynamic_interpretation_success(tmp_path, monkeypatch):
     interpretation = (updated.get("evaluation_summary") or {}).get("dynamic_interpretation", {})
     assert summary.get("used_dynamic") is True
     assert isinstance(interpretation.get("insights"), list) and interpretation["insights"]
-

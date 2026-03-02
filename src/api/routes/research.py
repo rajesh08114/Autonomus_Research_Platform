@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
@@ -9,6 +10,7 @@ from fastapi.responses import PlainTextResponse
 from src.api.dependencies import get_request_id
 from src.config.settings import settings
 from src.core.logger import get_logger
+from src.core.prompt_domain import validate_supported_prompt
 from src.db.repository import ExperimentRepository
 from src.graph.runner import (
     abort_experiment,
@@ -28,10 +30,27 @@ router = APIRouter()
 logger = get_logger(__name__)
 
 
+def _report_from_state_payload(state: dict[str, Any], report_path: str) -> str:
+    cached = str(state.get("documentation_content") or "")
+    if cached.strip():
+        return cached
+    plan_items = state.get("local_file_plan", [])
+    if not report_path or not isinstance(plan_items, list):
+        return ""
+    for item in reversed(plan_items):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("path", "")) != report_path:
+            continue
+        content = str(item.get("content", ""))
+        if content.strip():
+            return content
+    return ""
+
+
 @router.post("/research/start", status_code=201)
 async def post_start(request: StartResearchRequest, request_id: str = Depends(get_request_id)):
     logger.info("api.research.start", request_id=request_id, prompt_len=len(request.prompt), research_type=request.research_type)
-    normalized_research_type = str(request.research_type or "ai").strip().lower()
     if settings.effective_master_llm_provider == "huggingface" and not settings.huggingface_api_key:
         raise HTTPException(
             status_code=400,
@@ -40,27 +59,54 @@ async def post_start(request: StartResearchRequest, request_id: str = Depends(ge
                 "HF_API_KEY (or MASTER_LLM_API_KEY) is required.",
             ),
         )
+    try:
+        supported, resolved_research_type, reason = await validate_supported_prompt(
+            request.prompt,
+            research_type_hint=request.research_type,
+            phase="api_start_domain_gate",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=error_payload(
+                "DOMAIN_CLASSIFIER_UNAVAILABLE",
+                "Domain classification service is unavailable. Try again.",
+                details={"reason": str(exc)},
+            ),
+        ) from exc
+    if not supported:
+        raise HTTPException(
+            status_code=400,
+            detail=error_payload(
+                "UNSUPPORTED_RESEARCH_DOMAIN",
+                "Only AI and Quantum research prompts are supported.",
+                details={"reason": reason},
+            ),
+        )
     experiment_id = await start_experiment(
         request.prompt,
         request.config_overrides,
-        research_type=request.research_type,
+        research_type=resolved_research_type,
         user_id=request.user_id,
         test_mode=request.test_mode,
+        webhook_url=str(request.webhook_url) if request.webhook_url else None,
     )
     state = await get_experiment_or_404(experiment_id)
     data = {
         "experiment_id": experiment_id,
         "status": state["status"],
         "phase": state["phase"],
-        "research_type": state.get("research_type", request.research_type),
+        "research_type": state.get("research_type", resolved_research_type),
         "created_at": state["timestamp_start"],
         "execution_target": state.get("execution_target", "local_machine"),
         "execution_mode": state.get("execution_mode", "vscode_extension"),
+        "default_allow_research": bool(state.get("default_allow_research", False)),
         "llm": {"provider": state.get("llm_provider"), "model": state.get("llm_model")},
         "research_scope": {
             "user_id": state.get("research_user_id", "anonymous"),
             "test_mode": bool(state.get("test_mode", False)),
             "collection_key": state.get("collection_key"),
+            "webhook_enabled": bool(state.get("webhook_url")),
         },
         "estimated_duration_minutes": 15,
         "pending_questions": state.get("pending_user_question"),
@@ -211,7 +257,10 @@ async def get_research(experiment_id: str, request_id: str = Depends(get_request
         "llm_total_cost_usd": state.get("llm_total_cost_usd", 0.0),
         "execution_target": state.get("execution_target", "local_machine"),
         "execution_mode": state.get("execution_mode", "vscode_extension"),
+        "default_allow_research": bool(state.get("default_allow_research", False)),
         "llm": {"provider": state.get("llm_provider"), "model": state.get("llm_model")},
+        "pending_questions": state.get("pending_user_question"),
+        "pending_action": state.get("pending_user_confirm"),
         "research_scope": {
             "user_id": state.get("research_user_id", "anonymous"),
             "test_mode": bool(state.get("test_mode", False)),
@@ -253,9 +302,11 @@ async def get_status(
         "current_script": state["current_script"],
         "progress_pct": state_progress_pct(state),
         "waiting_for_user": state["status"] == "waiting_user",
+        "pending_questions": state.get("pending_user_question"),
         "pending_action": state.get("pending_user_confirm"),
         "execution_target": state.get("execution_target", "local_machine"),
         "execution_mode": state.get("execution_mode", "vscode_extension"),
+        "default_allow_research": bool(state.get("default_allow_research", False)),
         "llm_provider": state.get("llm_provider"),
         "llm_model": state.get("llm_model"),
         "last_updated": state.get("timestamp_end") or state["timestamp_start"],
@@ -329,15 +380,20 @@ async def get_report(
     except ValueError:
         raise HTTPException(status_code=404, detail=error_payload("EXPERIMENT_NOT_FOUND", f"Experiment {experiment_id} does not exist"))
 
-    report = state.get("documentation_path")
-    if not report or not Path(report).exists():
+    report = str(state.get("documentation_path") or "")
+    content = ""
+    if report and Path(report).exists():
+        content = Path(report).read_text(encoding="utf-8")
+    if not content:
+        content = _report_from_state_payload(state, report)
+    if not content:
         raise HTTPException(status_code=404, detail=error_payload("REPORT_NOT_FOUND", "Report not available yet"))
-    content = Path(report).read_text(encoding="utf-8")
+    report_path_value = report or f"{state['project_path']}/docs/final_report.md"
     if download:
-        return PlainTextResponse(content, headers={"Content-Disposition": f"attachment; filename={Path(report).name}"})
+        return PlainTextResponse(content, headers={"Content-Disposition": f"attachment; filename={Path(report_path_value).name}"})
     data = {
         "experiment_id": experiment_id,
-        "report_path": report,
+        "report_path": report_path_value,
         "generated_at": state.get("timestamp_end"),
         "word_count": len(content.split()),
         "sections": state.get("report_sections", []),

@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     WORKFLOW_BACKGROUND_ENABLED: bool = True
     EXECUTION_MODE: str = "vscode_extension"
     LOCAL_PYTHON_COMMAND: str = "python"
+    DEFAULT_ALLOW_RESEARCH: bool = False
     METRICS_TABLE_ENABLED: bool = True
     RL_ENABLED: bool = True
     RL_FEEDBACK_WINDOW: int = 200

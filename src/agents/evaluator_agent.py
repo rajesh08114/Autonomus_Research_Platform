@@ -7,6 +7,7 @@ from typing import Any
 
 from src.config.settings import settings
 from src.core.logger import get_logger
+from src.core.user_behavior import build_user_behavior_profile
 from src.db.repository import ExperimentRepository
 from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
@@ -52,6 +53,56 @@ def _quantum_benchmarks(state: ResearchState, metrics: dict[str, object]) -> dic
     }
 
 
+def _metrics_from_execution_logs(state: ResearchState) -> dict[str, float]:
+    extracted: dict[str, float] = {}
+    logs = state.get("execution_logs", []) if isinstance(state.get("execution_logs"), list) else []
+    metric_line_re = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+    for log in reversed(logs):
+        if not isinstance(log, dict):
+            continue
+        stdout = str(log.get("stdout", ""))
+        for line in stdout.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            if "metric" not in text.lower() and "=" not in text and ":" not in text:
+                continue
+            for name, value in metric_line_re.findall(text):
+                key = str(name or "").strip().lower()
+                if not key:
+                    continue
+                try:
+                    extracted[key] = float(value)
+                except Exception:
+                    continue
+        if extracted:
+            break
+    return extracted
+
+
+def _metrics_from_notebook_results(state: ResearchState) -> tuple[dict[str, float], dict[str, Any]]:
+    results_path = Path(state["project_path"]) / "outputs" / "notebook_results.json"
+    if not results_path.exists():
+        return {}, {}
+    try:
+        payload = json.loads(results_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, {}
+    metrics_raw = payload.get("metrics", {}) if isinstance(payload, dict) else {}
+    if not isinstance(metrics_raw, dict):
+        return {}, payload if isinstance(payload, dict) else {}
+    extracted: dict[str, float] = {}
+    for key, value in metrics_raw.items():
+        name = str(key or "").strip().lower()
+        if not name:
+            continue
+        try:
+            extracted[name] = float(value)
+        except Exception:
+            continue
+    return extracted, payload if isinstance(payload, dict) else {}
+
+
 async def _invoke_evaluator_dynamic_summary(state: ResearchState, metrics: dict[str, Any]) -> dict[str, Any]:
     system_prompt = (
         "SYSTEM ROLE: evaluator_dynamic_interpretation.\n"
@@ -70,6 +121,7 @@ async def _invoke_evaluator_dynamic_summary(state: ResearchState, metrics: dict[
             "framework": state.get("framework"),
             "requires_quantum": state.get("requires_quantum"),
             "dataset_source": state.get("dataset_source"),
+            "user_behavior_profile": build_user_behavior_profile(state),
         },
         indent=2,
         default=str,
@@ -143,6 +195,30 @@ async def evaluator_agent_node(state: ResearchState) -> ResearchState:
     if not isinstance(evaluation_map, dict):
         evaluation_map = {}
         metrics["evaluation"] = evaluation_map
+
+    extracted_eval = _metrics_from_execution_logs(state)
+    notebook_eval, notebook_payload = _metrics_from_notebook_results(state)
+    if notebook_payload:
+        metrics["notebook_execution"] = notebook_payload
+    if notebook_eval:
+        extracted_eval.update(notebook_eval)
+    if extracted_eval:
+        for name, value in extracted_eval.items():
+            evaluation_map[name] = value
+        if state["target_metric"] not in evaluation_map and extracted_eval:
+            first_name = next(iter(extracted_eval.keys()))
+            evaluation_map[state["target_metric"]] = float(extracted_eval.get(first_name, 0.0))
+        training = metrics.get("training")
+        if not isinstance(training, dict):
+            training = {}
+            metrics["training"] = training
+        if "duration_sec" not in training:
+            latest_log = (state.get("execution_logs") or [])[-1] if isinstance(state.get("execution_logs"), list) and state.get("execution_logs") else {}
+            try:
+                training["duration_sec"] = float((latest_log or {}).get("duration_sec", 0.0))
+            except Exception:
+                training["duration_sec"] = 0.0
+
     if state["target_metric"] not in evaluation_map:
         raise RuntimeError(f"Missing target metric '{state['target_metric']}' in evaluation output.")
 
@@ -215,4 +291,3 @@ async def evaluator_agent_node(state: ResearchState) -> ResearchState:
     }
     logger.info("agent.evaluator.end", experiment_id=state["experiment_id"], primary_metric=state["target_metric"], primary_value=primary)
     return state
-

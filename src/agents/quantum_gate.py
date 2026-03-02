@@ -12,6 +12,7 @@ from src.core.execution_mode import is_vscode_execution_mode
 from src.core.file_manager import write_text_file
 from src.core.local_actions import queue_local_file_action
 from src.core.logger import get_logger
+from src.core.user_behavior import build_user_behavior_profile
 from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
 from src.state.research_state import ResearchState
@@ -164,6 +165,7 @@ async def _invoke_quantum_llm(
             "allowed_import_roots": sorted(_allowed_import_roots(state)),
             "repair_violations": repair_violations,
             "existing_code": existing_code,
+            "user_behavior_profile": build_user_behavior_profile(state),
         },
         indent=2,
         default=str,
@@ -278,4 +280,3 @@ async def quantum_gate_node(state: ResearchState) -> ResearchState:
         state["created_files"].append(str(target))
     logger.info("agent.quantum_gate.end", experiment_id=state["experiment_id"], file_path=str(target), code_len=len(code))
     return state
-

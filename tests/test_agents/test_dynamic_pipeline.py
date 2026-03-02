@@ -169,7 +169,11 @@ async def test_doc_dynamic_success_writes_required_markers(tmp_path):
     summary = (updated.get("research_plan") or {}).get("doc_generation_summary", {})
     assert summary.get("used_dynamic") is True
     assert summary.get("fallback_static") is False
-    report_text = Path(updated["documentation_path"]).read_text(encoding="utf-8")
+    assert updated.get("pending_user_confirm", {}).get("action") == "apply_file_operations"
+    file_ops = updated.get("pending_user_confirm", {}).get("file_operations", [])
+    assert isinstance(file_ops, list) and file_ops
+    assert str(file_ops[0].get("path", "")) == str(updated.get("documentation_path", ""))
+    report_text = str(updated.get("documentation_content") or "")
     assert "# Abstract" in report_text
     assert "## Research Objective" in report_text
     assert "## Experimental Results" in report_text
@@ -190,5 +194,6 @@ async def test_doc_dynamic_fallback_to_legacy_builder(tmp_path, monkeypatch):
     updated = await doc_generator_agent_node(state)
     summary = (updated.get("research_plan") or {}).get("doc_generation_summary", {})
     assert summary.get("fallback_static") is True
-    report_text = Path(updated["documentation_path"]).read_text(encoding="utf-8")
+    assert updated.get("pending_user_confirm", {}).get("action") == "apply_file_operations"
+    report_text = str(updated.get("documentation_content") or "")
     assert "# Abstract" in report_text

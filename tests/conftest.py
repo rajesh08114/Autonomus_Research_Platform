@@ -23,6 +23,7 @@ from src.agents import (
 )
 from src.config.settings import settings
 from src.core import chat_assistant
+from src.core import prompt_domain
 
 
 def _extract_contract(user_prompt: str) -> tuple[str, str, str]:
@@ -50,6 +51,35 @@ async def _fake_invoke_master_llm(
 ) -> str:
     _ = (experiment_id, phase)
     context = f"{system_prompt}\n{user_prompt}".lower()
+
+    if "system role: prompt_domain_classifier" in context:
+        payload_obj: dict[str, Any] = {}
+        try:
+            payload_obj = json.loads(user_prompt) if user_prompt else {}
+        except Exception:
+            payload_obj = {}
+        prompt_text = str(payload_obj.get("prompt", "")).lower()
+        if any(token in prompt_text for token in ["quantum", "qubit", "qiskit", "pennylane", "cirq", "qaoa", "vqe"]):
+            return json.dumps({"domain": "quantum", "reason": "Prompt is quantum-oriented.", "confidence": 0.95})
+        if any(
+            token in prompt_text
+            for token in [
+                "ai",
+                "ml",
+                "machine learning",
+                "classifier",
+                "regression",
+                "clustering",
+                "dataset",
+                "model",
+                "research",
+                "experiment",
+                "pipeline",
+                "benchmark",
+            ]
+        ):
+            return json.dumps({"domain": "ai", "reason": "Prompt is AI/ML-oriented.", "confidence": 0.92})
+        return json.dumps({"domain": "unsupported", "reason": "Prompt does not target AI/Quantum workflow.", "confidence": 0.9})
 
     if "parameters.questions" in context or "clarification agent" in context:
         payload = {
@@ -423,6 +453,7 @@ def _stub_llm_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(quantum_gate, "invoke_master_llm", _fake_invoke_master_llm)
     monkeypatch.setattr(evaluator_agent, "invoke_master_llm", _fake_invoke_master_llm)
     monkeypatch.setattr(doc_generator_agent, "invoke_master_llm", _fake_invoke_master_llm)
+    monkeypatch.setattr(prompt_domain, "invoke_master_llm", _fake_invoke_master_llm)
     monkeypatch.setattr(chat_assistant, "_invoke_huggingface_chat", _fake_chat_hf)
     monkeypatch.setattr(api_app, "assert_master_llm_ready", _fake_llm_readiness)
 

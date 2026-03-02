@@ -11,7 +11,7 @@ from pathlib import Path
 import uuid
 
 from src.config.settings import settings
-from src.core.execution_mode import is_vscode_execution_mode, local_python_command
+from src.core.execution_mode import is_vscode_execution_mode, local_python_for_state
 from src.core.logger import get_logger
 from src.core.security import ensure_project_path, sanitize_subprocess_args
 from src.db.repository import ExperimentRepository
@@ -87,6 +87,9 @@ def classify_error(stderr: str) -> str:
     markers = [
         "ModuleNotFoundError",
         "ImportError",
+        "NameError",
+        "TypeError",
+        "KeyError",
         "SyntaxError",
         "AttributeError",
         "ValueError",
@@ -122,6 +125,10 @@ async def subprocess_runner_node(state: ResearchState) -> ResearchState:
     if not state["execution_order"]:
         return state
 
+    if state["execution_logs"] and int(state["execution_logs"][-1]["returncode"]) != 0:
+        # Preserve failure handling path in runner; do not queue the next script.
+        return state
+
     idx = len(state["execution_logs"])
     if idx >= len(state["execution_order"]):
         return state
@@ -133,11 +140,28 @@ async def subprocess_runner_node(state: ResearchState) -> ResearchState:
     project_path = Path(state["project_path"]).resolve()
 
     if is_vscode_execution_mode(state):
-        local_python = local_python_command()
+        local_python = local_python_for_state(state)
         file_plan = _dedupe_local_file_plan(state)
         materialized = set(state.get("local_materialized_files", []))
         materialize = [item for item in file_plan if item["path"] not in materialized]
         command = [local_python, script]
+        existing = state.get("pending_user_confirm") or {}
+        existing_action = str(existing.get("action", ""))
+        existing_script = str(existing.get("script_path", ""))
+        existing_phase = str(existing.get("phase", ""))
+        existing_commands_raw = existing.get("commands", [])
+        if isinstance(existing_commands_raw, list):
+            existing_commands = [str(x) for x in existing_commands_raw]
+        else:
+            existing_commands = [str(existing_commands_raw)] if str(existing_commands_raw).strip() else []
+        if (
+            existing_action == "run_local_commands"
+            and existing_phase == "subprocess_runner"
+            and existing_script == str(script)
+            and existing_commands == command
+        ):
+            state["status"] = ExperimentStatus.WAITING.value
+            return state
         state["pending_user_confirm"] = {
             "action_id": f"act_{uuid.uuid4().hex[:8]}",
             "action": "run_local_commands",

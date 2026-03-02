@@ -355,10 +355,51 @@ def _validate_doc(state: ResearchState) -> tuple[list[str], list[str]]:
         ensure_project_path(doc_path, state["project_path"])
     except Exception:
         errors.append("documentation_path outside project")
-    if not Path(doc_path).exists():
-        errors.append("final report file missing")
-        return errors, warnings
-    report_text = Path(doc_path).read_text(encoding="utf-8", errors="ignore")
+    report_path = Path(doc_path)
+    if is_vscode_execution_mode(state):
+        pending = state.get("pending_user_confirm") or {}
+        pending_write = False
+        if str(pending.get("action", "")).strip().lower() == "apply_file_operations":
+            for item in pending.get("file_operations", []) if isinstance(pending.get("file_operations"), list) else []:
+                if str(item.get("path", "")).strip() == doc_path:
+                    pending_write = True
+                    break
+            if not pending_write:
+                pending_write = doc_path in {
+                    str(item).strip()
+                    for item in (pending.get("created_files", []) if isinstance(pending.get("created_files"), list) else [])
+                    if str(item).strip()
+                }
+        local_materialized = {
+            str(item).strip()
+            for item in (state.get("local_materialized_files", []) if isinstance(state.get("local_materialized_files"), list) else [])
+            if str(item).strip()
+        }
+        report_text = ""
+        if report_path.exists():
+            report_text = report_path.read_text(encoding="utf-8", errors="ignore")
+        else:
+            report_text = str(state.get("documentation_content") or "")
+            if not report_text:
+                for item in reversed(state.get("local_file_plan", []) if isinstance(state.get("local_file_plan"), list) else []):
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("path", "")).strip() != doc_path:
+                        continue
+                    report_text = str(item.get("content", ""))
+                    if report_text:
+                        break
+        if not report_text.strip() and not pending_write and doc_path not in local_materialized:
+            errors.append("final report file missing")
+            return errors, warnings
+        if not report_text.strip():
+            warnings.append("Final report content not available for validation yet")
+            return errors, warnings
+    else:
+        if not report_path.exists():
+            errors.append("final report file missing")
+            return errors, warnings
+        report_text = report_path.read_text(encoding="utf-8", errors="ignore")
     for section in ["# Abstract", "## Research Objective", "## Experimental Results", "## Conclusion & Interpretation"]:
         if section not in report_text:
             warnings.append(f"Final report missing section marker: {section}")

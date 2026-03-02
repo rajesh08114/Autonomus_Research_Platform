@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from src.config.settings import settings
+from src.core.execution_mode import is_vscode_execution_mode
+from src.core.local_actions import queue_local_file_action
 from src.core.logger import get_logger
+from src.core.user_behavior import build_user_behavior_profile
 from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
 from src.state.research_state import ExperimentStatus, ResearchState
@@ -16,7 +20,7 @@ _TRUE_VALUES = {"1", "true", "yes", "y", "on", "enable", "enabled"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off", "disable", "disabled"}
 _ALGORITHM_CLASS_OPTIONS = {"supervised", "unsupervised", "reinforcement", "quantum_ml"}
 _DATASET_SOURCE_OPTIONS = {"kaggle", "sklearn", "synthetic", "upload"}
-_OUTPUT_FORMAT_OPTIONS = {".py", ".ipynb"}
+_OUTPUT_FORMAT_OPTIONS = {".py", ".ipynb", "hybrid"}
 _HARDWARE_OPTIONS = {"cpu", "cuda", "ibmq"}
 _FRAMEWORK_OPTIONS = {"auto", "sklearn", "pytorch"}
 _PROBLEM_TYPE_OPTIONS = {"auto", "classification", "regression", "clustering", "reinforcement", "forecasting", "generation"}
@@ -115,26 +119,26 @@ def _infer_problem_type(clar: dict[str, Any], algorithm_class: str, target_metri
 
 def _package_set_for_state(state: ResearchState) -> list[str]:
     packages = {
-        "numpy==2.4.2",
-        "pandas==3.0.0",
-        "matplotlib==3.10.3",
-        "scikit-learn==1.8.0",
-        "structlog==25.5.0",
+        "numpy==1.26.4",
+        "pandas==2.2.2",
+        "matplotlib==3.8.4",
+        "scikit-learn==1.5.2",
+        "structlog==24.4.0",
     }
     framework = state["framework"]
     if framework == "pytorch":
-        packages.update({"torch==2.10.0", "torchvision==0.25.0"})
+        packages.update({"torch==2.5.1", "torchvision==0.20.1"})
     if state["requires_quantum"]:
         qf = state["quantum_framework"] or "pennylane"
         if qf == "pennylane":
-            packages.update({"pennylane==0.43.0", "pennylane-lightning==0.43.0"})
+            packages.update({"pennylane==0.37.0", "pennylane-lightning==0.37.0"})
         elif qf == "qiskit":
-            packages.update({"qiskit==2.3.0", "qiskit-aer==0.17.2"})
+            packages.update({"qiskit==1.2.4", "qiskit-aer==0.15.1"})
         elif qf == "cirq":
-            packages.add("cirq==1.6.1")
+            packages.add("cirq==1.3.0")
     if state["dataset_source"] == "kaggle":
         packages.add("kaggle==2.0.0")
-    if state["output_format"] == ".ipynb":
+    if _wants_notebook_artifacts(str(state.get("output_format") or "")):
         packages.update({"jupyter==1.1.1", "ipykernel==7.2.0"})
     return sorted(packages)
 
@@ -154,6 +158,10 @@ def _clean_text_list(value: Any, limit: int = 6) -> list[str]:
 
 def _is_valid_pin(value: str) -> bool:
     return bool(re.match(_PACKAGE_PIN_PATTERN, value or ""))
+
+
+def _wants_notebook_artifacts(output_format: str) -> bool:
+    return str(output_format or "").strip().lower() in {".ipynb", "hybrid"}
 
 
 def _build_base_plan(
@@ -183,8 +191,10 @@ def _build_base_plan(
             3,
             f"generate {state['quantum_framework']} circuit ({state['quantum_algorithm']}, {state['quantum_qubit_count']} qubits)",
         )
-    if state["output_format"] == ".ipynb":
+    if _wants_notebook_artifacts(str(state.get("output_format") or "")):
         methodology.append("export notebook-friendly artifacts")
+    if str(state.get("output_format") or "").strip().lower() == "hybrid":
+        methodology.append("maintain synchronized script + notebook outputs")
 
     algorithm_name = "classical_classifier"
     if state["requires_quantum"]:
@@ -229,7 +239,171 @@ def _build_base_plan(
     }
 
 
-async def _invoke_dynamic_planner(state: ResearchState, base_plan: dict[str, Any]) -> dict[str, Any]:
+def _planner_scaffold_markdown(state: ResearchState, plan: dict[str, Any]) -> str:
+    methodology = plan.get("methodology", [])
+    steps = [f"- {str(step)}" for step in methodology] if isinstance(methodology, list) else []
+    packages = [f"- {str(spec)}" for spec in state.get("required_packages", [])[:40]]
+    if not packages:
+        packages = ["- package resolution pending"]
+    return (
+        "# Planned Workspace Scaffold\n\n"
+        f"Experiment: `{state['experiment_id']}`\n\n"
+        "## Objective\n\n"
+        f"{str(plan.get('objective') or state.get('user_prompt') or '')}\n\n"
+        "## Methodology\n\n"
+        f"{chr(10).join(steps) if steps else '- methodology pending'}\n\n"
+        "## Package Baseline\n\n"
+        f"{chr(10).join(packages)}\n"
+    )
+
+
+def _planner_notebook_cell_plan(state: ResearchState) -> list[dict[str, Any]]:
+    metric = str(state.get("target_metric") or "accuracy")
+    return [
+        {
+            "cell_id": "cell_01_objective",
+            "cell_type": "markdown",
+            "purpose": "Capture objective and assumptions",
+            "expects_output": False,
+        },
+        {
+            "cell_id": "cell_02_imports_setup",
+            "cell_type": "code",
+            "purpose": "Import project modules and initialize reproducibility settings",
+            "expects_output": True,
+        },
+        {
+            "cell_id": "cell_03_data_loading",
+            "cell_type": "code",
+            "purpose": "Load and preprocess dataset from generated pipeline",
+            "expects_output": True,
+        },
+        {
+            "cell_id": "cell_04_training",
+            "cell_type": "code",
+            "purpose": "Train model and produce training artifacts",
+            "expects_output": True,
+        },
+        {
+            "cell_id": "cell_05_evaluation",
+            "cell_type": "code",
+            "purpose": f"Evaluate model and print primary metric ({metric})",
+            "expects_output": True,
+        },
+        {
+            "cell_id": "cell_06_persist_results",
+            "cell_type": "code",
+            "purpose": "Persist notebook execution summary to outputs/notebook_results.json",
+            "expects_output": True,
+        },
+    ]
+
+
+def _planner_notebook_stub(state: ResearchState) -> str:
+    objective = str(state.get("user_prompt") or "").strip()
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [f"# Experiment Notebook\n\nObjective: {objective}\n"],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "# Notebook code cells are generated in code_generator phase.\n",
+                    "print('Notebook scaffold ready')\n",
+                ],
+            },
+        ],
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    return json.dumps(notebook, indent=2)
+
+
+def _planner_scaffold_operations(state: ResearchState, plan: dict[str, Any]) -> list[dict[str, str]]:
+    project = Path(state["project_path"]).resolve()
+    required_dirs = [
+        "src",
+        "data",
+        "data/raw",
+        "data/processed",
+        "outputs",
+        "outputs/plots",
+        "outputs/model_checkpoint",
+        "logs",
+        "docs",
+    ]
+    if _wants_notebook_artifacts(str(state.get("output_format") or "")):
+        required_dirs.append("notebooks")
+    operations: list[dict[str, str]] = []
+    for rel in required_dirs:
+        operations.append(
+            {
+                "path": str((project / rel).resolve()),
+                "mode": "mkdir",
+                "phase": "planner",
+            }
+        )
+    operations.append(
+        {
+            "path": str((project / "docs" / "plan.md").resolve()),
+            "mode": "write",
+            "content": _planner_scaffold_markdown(state, plan),
+            "phase": "planner",
+        }
+    )
+    for rel in (
+        "config.py",
+        "main.py",
+        "src/__init__.py",
+        "src/utils.py",
+        "src/preprocessing.py",
+        "src/model.py",
+        "src/train.py",
+        "src/evaluate.py",
+    ):
+        operations.append(
+            {
+                "path": str((project / rel).resolve()),
+                "mode": "write",
+                "content": "",
+                "phase": "planner",
+            }
+        )
+    if _wants_notebook_artifacts(str(state.get("output_format") or "")):
+        operations.append(
+            {
+                "path": str((project / "notebooks" / "research_workflow.ipynb").resolve()),
+                "mode": "write",
+                "content": _planner_notebook_stub(state),
+                "phase": "planner",
+            }
+        )
+        operations.append(
+            {
+                "path": str((project / "notebooks" / "cell_plan.json").resolve()),
+                "mode": "write",
+                "content": json.dumps(_planner_notebook_cell_plan(state), indent=2),
+                "phase": "planner",
+            }
+        )
+    return operations
+
+
+async def _invoke_dynamic_planner(
+    state: ResearchState,
+    base_plan: dict[str, Any],
+    user_behavior_profile: dict[str, Any],
+) -> dict[str, Any]:
     system_prompt = (
         "SYSTEM ROLE: planner_dynamic_plan.\n"
         "Return JSON only with keys:\n"
@@ -260,6 +434,11 @@ async def _invoke_dynamic_planner(state: ResearchState, base_plan: dict[str, Any
             },
             "target_metric": state.get("target_metric"),
             "required_packages": state.get("required_packages", []),
+            "local_runtime": {
+                "python_command": state.get("local_python_command"),
+                "hardware_profile": state.get("local_hardware_profile", {}),
+            },
+            "user_behavior_profile": user_behavior_profile,
         },
         indent=2,
         default=str,
@@ -399,12 +578,13 @@ async def planner_agent_node(state: ResearchState) -> ResearchState:
         auto_retry_enabled=auto_retry_enabled,
     )
     state["required_packages"] = _package_set_for_state(state)
+    user_behavior_profile = build_user_behavior_profile(state)
 
     used_dynamic = False
     fallback_static = False
     dynamic_payload_keys: list[str] = []
     try:
-        dynamic_payload = await _invoke_dynamic_planner(state, plan)
+        dynamic_payload = await _invoke_dynamic_planner(state, plan, user_behavior_profile)
         if not dynamic_payload:
             if settings.DYNAMIC_NONCODEGEN_FALLBACK_STATIC:
                 fallback_static = True
@@ -460,7 +640,43 @@ async def planner_agent_node(state: ResearchState) -> ResearchState:
         "fallback_static": fallback_static,
         "dynamic_payload_keys": dynamic_payload_keys,
         "package_count": len(state["required_packages"]),
+        "user_decision_style": (user_behavior_profile.get("interaction") or {}).get("decision_style"),
     }
+
+    scaffold_operations = _planner_scaffold_operations(state, plan)
+    if is_vscode_execution_mode(state):
+        queued = queue_local_file_action(
+            state=state,
+            phase="planner",
+            file_operations=scaffold_operations,
+            next_phase="env_manager",
+            reason="Create initial project folders and planning notes locally before environment setup",
+            cwd=state["project_path"],
+        )
+        state["research_plan"]["planner_dynamic_summary"]["scaffold_queued"] = bool(queued)
+        state["research_plan"]["planner_dynamic_summary"]["scaffold_operation_count"] = len(scaffold_operations)
+        if queued:
+            logger.info(
+                "agent.planner.pending_local_scaffold",
+                experiment_id=state["experiment_id"],
+                operation_count=len(scaffold_operations),
+                next_phase="env_manager",
+            )
+            return state
+    else:
+        for op in scaffold_operations:
+            mode = str(op.get("mode", "write")).strip().lower()
+            target = Path(str(op.get("path", ""))).resolve()
+            if mode == "mkdir":
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(str(op.get("content", "")), encoding="utf-8")
+            path_text = str(target)
+            if path_text not in state["created_files"]:
+                state["created_files"].append(path_text)
+        state["research_plan"]["planner_dynamic_summary"]["scaffold_queued"] = False
+        state["research_plan"]["planner_dynamic_summary"]["scaffold_operation_count"] = len(scaffold_operations)
 
     state["status"] = ExperimentStatus.RUNNING.value
     logger.info(
@@ -472,4 +688,3 @@ async def planner_agent_node(state: ResearchState) -> ResearchState:
         package_count=len(state["required_packages"]),
     )
     return state
-

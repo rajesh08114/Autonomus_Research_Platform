@@ -13,6 +13,7 @@ from src.core.execution_mode import is_vscode_execution_mode
 from src.core.file_manager import write_text_file
 from src.core.local_actions import queue_local_file_action
 from src.core.logger import get_logger
+from src.core.user_behavior import build_user_behavior_profile
 from src.llm.dynamic_parser import parse_json_object
 from src.llm.master_llm import invoke_master_llm
 from src.state.research_state import ResearchState
@@ -44,6 +45,40 @@ _FRAMEWORK_IMPORT_ROOTS: dict[str, set[str]] = {
     "qiskit": {"qiskit"},
     "pennylane": {"pennylane"},
 }
+
+
+def _prompt_safe_path(raw_path: Any, project: Path | None = None) -> str:
+    text = str(raw_path or "").strip()
+    if not text:
+        return ""
+    candidate = Path(text).expanduser()
+    if project is not None:
+        try:
+            rel = candidate.resolve().relative_to(project.resolve())
+            return rel.as_posix()
+        except Exception:
+            pass
+    return text.replace("\\", "/")
+
+
+def _sanitize_windows_path_literals(content: str) -> str:
+    # Convert quoted absolute Windows paths to POSIX style to avoid unicodeescape
+    # parsing failures like "C:\Users\..." in generated Python.
+    pattern = re.compile(r"([\"'])([A-Za-z]:\\[^\"'\r\n]+)\1")
+
+    def repl(match: re.Match[str]) -> str:
+        quote = match.group(1)
+        body = match.group(2).replace("\\", "/")
+        return f"{quote}{body}{quote}"
+
+    return pattern.sub(repl, content)
+
+
+def _sanitize_manifest_python(manifest: dict[str, str]) -> None:
+    for abs_path, content in list(manifest.items()):
+        if Path(abs_path).suffix != ".py":
+            continue
+        manifest[abs_path] = _sanitize_windows_path_literals(str(content))
 
 
 def _should_inject_failure(point: str) -> bool:
@@ -296,12 +331,225 @@ def _collect_strict_violations(
     return violations
 
 
+def _wants_notebook_artifacts(state: ResearchState) -> bool:
+    fmt = str(state.get("output_format", ".py")).strip().lower()
+    return fmt in {".ipynb", "hybrid"}
+
+
+def _to_notebook_lines(source: str) -> list[str]:
+    return str(source or "").splitlines(keepends=True)
+
+
+def _strip_notebook_magics(source: str) -> str:
+    kept: list[str] = []
+    for line in str(source or "").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("%") or stripped.startswith("!"):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _build_notebook_cell_plan(state: ResearchState) -> list[dict[str, Any]]:
+    metric = str(state.get("target_metric") or "accuracy")
+    return [
+        {
+            "cell_id": "cell_01_context",
+            "cell_type": "markdown",
+            "purpose": "Objective and execution assumptions",
+            "expects_output": False,
+        },
+        {
+            "cell_id": "cell_02_setup",
+            "cell_type": "code",
+            "purpose": "Prepare runtime context",
+            "expects_output": True,
+        },
+        {
+            "cell_id": "cell_03_pipeline",
+            "cell_type": "code",
+            "purpose": "Execute generated main.py from notebook",
+            "expects_output": True,
+        },
+        {
+            "cell_id": "cell_04_metrics",
+            "cell_type": "code",
+            "purpose": f"Read metrics and emit METRIC {metric}",
+            "expects_output": True,
+        },
+    ]
+
+
+def _build_runtime_notebook(state: ResearchState) -> str:
+    objective = str(state.get("user_prompt") or "").strip()
+    metric = str(state.get("target_metric") or "accuracy")
+    payload = {
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": _to_notebook_lines(f"# Generated Research Notebook\n\nObjective: {objective}\n"),
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": _to_notebook_lines(
+                    "from pathlib import Path\n"
+                    "import json\n"
+                    "import runpy\n"
+                    "PROJECT_ROOT = Path.cwd()\n"
+                    "print('PROJECT_ROOT:', PROJECT_ROOT)\n"
+                ),
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": _to_notebook_lines(
+                    "main_path = PROJECT_ROOT / 'main.py'\n"
+                    "if not main_path.exists():\n"
+                    "    raise FileNotFoundError(f'main.py missing: {main_path}')\n"
+                    "runpy.run_path(str(main_path), run_name='__main__')\n"
+                    "print('PIPELINE_MAIN_EXECUTED')\n"
+                ),
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": _to_notebook_lines(
+                    "metrics_path = PROJECT_ROOT / 'outputs' / 'metrics.json'\n"
+                    "evaluation = {}\n"
+                    "if metrics_path.exists():\n"
+                    "    metrics_obj = json.loads(metrics_path.read_text(encoding='utf-8'))\n"
+                    "    if isinstance(metrics_obj, dict):\n"
+                    "        maybe_eval = metrics_obj.get('evaluation', {})\n"
+                    "        evaluation = maybe_eval if isinstance(maybe_eval, dict) else {}\n"
+                    "print('NOTEBOOK_EVALUATION:', evaluation)\n"
+                    f"primary_metric = {json.dumps(metric)}\n"
+                    "if primary_metric in evaluation:\n"
+                    "    print(f'METRIC {primary_metric}: {evaluation[primary_metric]}')\n"
+                ),
+            },
+        ],
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    return json.dumps(payload, indent=2)
+
+
+def _build_notebook_runner_script(project: Path, metric: str) -> str:
+    notebook_path = str((project / "notebooks" / "research_workflow.ipynb").resolve())
+    return (
+        "from __future__ import annotations\n\n"
+        "import ast\n"
+        "import json\n"
+        "import time\n"
+        "from pathlib import Path\n\n"
+        f"NOTEBOOK_PATH = Path(r\"{notebook_path}\")\n"
+        "OUTPUT_PATH = Path('outputs') / 'notebook_results.json'\n"
+        f"PRIMARY_METRIC = {json.dumps(str(metric or 'accuracy'))}\n\n"
+        "def _clean(code: str) -> str:\n"
+        "    lines = []\n"
+        "    for raw in str(code or '').splitlines():\n"
+        "        s = raw.lstrip()\n"
+        "        if s.startswith('%') or s.startswith('!'):\n"
+        "            continue\n"
+        "        lines.append(raw)\n"
+        "    return '\\n'.join(lines).strip()\n\n"
+        "def run() -> int:\n"
+        "    started = time.time()\n"
+        "    notebook = json.loads(NOTEBOOK_PATH.read_text(encoding='utf-8'))\n"
+        "    ns: dict[str, object] = {'__name__': '__main__'}\n"
+        "    cell_results = []\n"
+        "    for idx, cell in enumerate(notebook.get('cells', []), start=1):\n"
+        "        if str((cell or {}).get('cell_type', '')) != 'code':\n"
+        "            continue\n"
+        "        code = _clean(''.join((cell or {}).get('source') or []))\n"
+        "        if not code:\n"
+        "            continue\n"
+        "        try:\n"
+        "            ast.parse(code, filename=f'notebook_cell_{idx}.py')\n"
+        "            exec(compile(code, filename=f'notebook_cell_{idx}.py', mode='exec'), ns, ns)\n"
+        "            cell_results.append({'cell': idx, 'status': 'ok'})\n"
+        "        except Exception as exc:\n"
+        "            cell_results.append({'cell': idx, 'status': 'error', 'error': str(exc)})\n"
+        "    metrics = {}\n"
+        "    if isinstance(ns.get('metrics'), dict):\n"
+        "        for key, value in (ns.get('metrics') or {}).items():\n"
+        "            try:\n"
+        "                metrics[str(key).lower()] = float(value)\n"
+        "            except Exception:\n"
+        "                continue\n"
+        "    payload = {\n"
+        "        'notebook_path': str(NOTEBOOK_PATH),\n"
+        "        'cell_results': cell_results,\n"
+        "        'metrics': metrics,\n"
+        "        'duration_sec': float(time.time() - started),\n"
+        "    }\n"
+        "    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    OUTPUT_PATH.write_text(json.dumps(payload, indent=2), encoding='utf-8')\n"
+        "    print('NOTEBOOK_RESULTS:', json.dumps(payload))\n"
+        "    if PRIMARY_METRIC in metrics:\n"
+        "        print(f'METRIC {PRIMARY_METRIC}: {metrics[PRIMARY_METRIC]}')\n"
+        "    return 0\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(run())\n"
+    )
+
+
+def _validate_notebook_content(content: str) -> list[str]:
+    violations: list[str] = []
+    try:
+        parsed = json.loads(content)
+    except Exception as exc:
+        return [f"invalid notebook JSON: {exc}"]
+    cells = parsed.get("cells") if isinstance(parsed, dict) else None
+    if not isinstance(cells, list) or not cells:
+        return ["notebook contains no cells"]
+    for idx, cell in enumerate(cells, start=1):
+        if not isinstance(cell, dict) or str(cell.get("cell_type", "")) != "code":
+            continue
+        code = _strip_notebook_magics("".join(cell.get("source") or []))
+        if not code:
+            continue
+        try:
+            ast.parse(code, filename=f"notebook_cell_{idx}.py")
+        except SyntaxError as exc:
+            violations.append(f"cell {idx} syntax error: {exc.msg}")
+    return violations
+
+
+def _ensure_notebook_artifacts(state: ResearchState, manifest: dict[str, str], project: Path) -> None:
+    if not _wants_notebook_artifacts(state):
+        return
+    notebook = _build_runtime_notebook(state)
+    violations = _validate_notebook_content(notebook)
+    if violations:
+        raise RuntimeError(f"notebook validation failed: {violations}")
+    notebook_path = str((project / "notebooks" / "research_workflow.ipynb").resolve())
+    plan_path = str((project / "notebooks" / "cell_plan.json").resolve())
+    runner_path = str((project / "notebooks" / "run_notebook.py").resolve())
+    manifest[notebook_path] = notebook
+    manifest[plan_path] = json.dumps(_build_notebook_cell_plan(state), indent=2)
+    manifest[runner_path] = _build_notebook_runner_script(project, str(state.get("target_metric") or "accuracy"))
+
+
 def _build_codegen_context(
     state: ResearchState,
     problem_type: str,
     code_level: str,
     algorithm_class: str,
 ) -> dict[str, Any]:
+    project_root = Path(str(state.get("project_path") or ".")).expanduser()
     return {
         "experiment_id": state.get("experiment_id"),
         "user_prompt": state.get("user_prompt"),
@@ -310,6 +558,7 @@ def _build_codegen_context(
         "code_level": code_level,
         "algorithm_class": algorithm_class,
         "framework": state.get("framework"),
+        "output_format": state.get("output_format", ".py"),
         "python_version": state.get("python_version"),
         "target_metric": state.get("target_metric"),
         "requires_quantum": bool(state.get("requires_quantum")),
@@ -318,7 +567,7 @@ def _build_codegen_context(
         "quantum_qubit_count": state.get("quantum_qubit_count"),
         "quantum_backend": state.get("quantum_backend"),
         "dataset_source": state.get("dataset_source"),
-        "dataset_path": state.get("dataset_path"),
+        "dataset_path": _prompt_safe_path(state.get("dataset_path"), project_root),
         "kaggle_dataset_id": state.get("kaggle_dataset_id"),
         "hardware_target": state.get("hardware_target"),
         "max_epochs": state.get("max_epochs"),
@@ -329,6 +578,7 @@ def _build_codegen_context(
         "data_report": state.get("data_report") or {},
         "clarifications": state.get("clarifications") or {},
         "research_plan": state.get("research_plan") or {},
+        "user_behavior_profile": build_user_behavior_profile(state),
     }
 
 
@@ -357,6 +607,7 @@ async def _invoke_codegen_llm(
         "- Keep paths strictly under project root and use relative paths.\n"
         "- config.py must include PROBLEM_TYPE and CODE_LEVEL constants.\n"
         "- main.py must be runnable entrypoint for the generated project.\n"
+        "- Always generate required Python pipeline files even if output_format requests notebook or hybrid mode.\n"
         "- Preprocessing must adapt to state.data_report and detected problem_type; avoid fixed hard-coded preprocessing steps.\n"
     )
     if repair_violations:
@@ -405,6 +656,7 @@ async def _generate_dynamic_files(
         required_relative_files=required_relative_files,
     )
     manifest = _normalize_manifest(project, _extract_file_items(payload))
+    _sanitize_manifest_python(manifest)
     _ensure_config_contract(
         manifest=manifest,
         project=project,
@@ -440,6 +692,7 @@ async def _generate_dynamic_files(
         )
         repaired_manifest = _normalize_manifest(project, _extract_file_items(payload))
         if repaired_manifest:
+            _sanitize_manifest_python(repaired_manifest)
             manifest.update(repaired_manifest)
         _ensure_config_contract(
             manifest=manifest,
@@ -495,8 +748,11 @@ async def code_gen_agent_node(state: ResearchState) -> ResearchState:
         "logs",
         "docs",
     ]
-    for rel in required_dirs:
-        (project / rel).mkdir(parents=True, exist_ok=True)
+    if _wants_notebook_artifacts(state):
+        required_dirs.append("notebooks")
+    if not local_mode:
+        for rel in required_dirs:
+            (project / rel).mkdir(parents=True, exist_ok=True)
 
     try:
         files = await _generate_dynamic_files(
@@ -513,6 +769,7 @@ async def code_gen_agent_node(state: ResearchState) -> ResearchState:
     if _should_inject_failure("codegen_syntax"):
         main_path = str((project / "main.py").resolve())
         files[main_path] = f"{files.get(main_path, '')}\nthis is invalid python\n"
+    _ensure_notebook_artifacts(state, files, project)
 
     if local_mode:
         plan = state.setdefault("local_file_plan", [])

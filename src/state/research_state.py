@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional, TypedDict
 import time
 
@@ -72,6 +73,21 @@ class LocalActionResult(TypedDict):
     metadata: dict[str, Any]
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value in {0, 1}:
+            return bool(value)
+        return default
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled", "enable"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled", "disable"}:
+        return False
+    return default
+
+
 class ResearchState(TypedDict):
     experiment_id: str
     project_path: str
@@ -128,6 +144,7 @@ class ResearchState(TypedDict):
     evaluation_summary: dict[str, Any]
 
     documentation_path: Optional[str]
+    documentation_content: Optional[str]
     report_sections: list[str]
 
     target_metric: str
@@ -143,22 +160,28 @@ class ResearchState(TypedDict):
     llm_model: str
     execution_target: str
     execution_mode: str
+    default_allow_research: bool
     confirmations_requested: int
     confirmations_processed: int
     phase_timings: dict[str, float]
     research_user_id: str
     test_mode: bool
     collection_key: str
+    webhook_url: str
     local_file_plan: list[LocalFilePlanItem]
     local_materialized_files: list[str]
     local_action_history: list[dict[str, Any]]
     last_local_action_result: Optional[LocalActionResult]
+    local_hardware_profile: dict[str, Any]
+    local_python_command: str
 
 
 def new_research_state(experiment_id: str, project_path: str, prompt: str, overrides: dict[str, Any]) -> ResearchState:
+    resolved_project_path = str(Path(project_path).expanduser().resolve())
+    resolved_project = Path(resolved_project_path)
     return ResearchState(
         experiment_id=experiment_id,
-        project_path=project_path,
+        project_path=resolved_project_path,
         phase="clarifier",
         status=ExperimentStatus.PENDING.value,
         timestamp_start=time.time(),
@@ -177,11 +200,11 @@ def new_research_state(experiment_id: str, project_path: str, prompt: str, overr
         python_version=str(overrides.get("python_version", "3.11")),
         required_packages=[],
         installed_packages=[],
-        venv_path=f"{project_path}/.venv",
+        venv_path=str((resolved_project / ".venv").resolve()),
         venv_ready=False,
         output_format=str(overrides.get("output_format", ".py")),
         dataset_source=str(overrides.get("dataset_source", "sklearn")),
-        dataset_path=f"{project_path}/data/raw",
+        dataset_path=str((resolved_project / "data" / "raw").resolve()),
         kaggle_dataset_id=overrides.get("kaggle_dataset_id"),
         data_report={},
         created_files=[],
@@ -201,6 +224,7 @@ def new_research_state(experiment_id: str, project_path: str, prompt: str, overr
         plots_generated=[],
         evaluation_summary={},
         documentation_path=None,
+        documentation_content=None,
         report_sections=[],
         target_metric=str(overrides.get("target_metric", "accuracy")),
         hardware_target=str(overrides.get("hardware_target", "cpu")),
@@ -214,14 +238,18 @@ def new_research_state(experiment_id: str, project_path: str, prompt: str, overr
         llm_model="",
         execution_target="local_machine",
         execution_mode=str(overrides.get("execution_mode", "vscode_extension")),
+        default_allow_research=_as_bool(overrides.get("default_allow_research", False), default=False),
         confirmations_requested=0,
         confirmations_processed=0,
         phase_timings={},
         research_user_id=str(overrides.get("user_id", "anonymous")),
         test_mode=bool(overrides.get("test_mode", False)),
         collection_key=str(overrides.get("collection_key", "user:anonymous")),
+        webhook_url=str(overrides.get("webhook_url", "") or ""),
         local_file_plan=[],
         local_materialized_files=[],
         local_action_history=[],
         last_local_action_result=None,
+        local_hardware_profile=dict(overrides.get("local_hardware_profile") or {}),
+        local_python_command=str(overrides.get("local_python_command", "python")),
     )
